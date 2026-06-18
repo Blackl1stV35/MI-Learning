@@ -1,0 +1,25 @@
+[package]
+name    = "signal_server"
+version = "0.2.0"
+edition = "2021"
+
+[[bin]]
+name = "signal_server"
+path = "src/main.rs"
+
+[dependencies]
+zmq        = "0.10"
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow     = "1"
+log        = "0.4"
+env_logger = "0.11"
+# Pure Rust matrix ops — no rand dependency, no version conflicts
+ndarray    = "0.15"
+
+[target.'cfg(windows)'.build-dependencies]
+
+[profile.release]
+opt-level     = 3
+lto           = true
+codegen-units = 1
