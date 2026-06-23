@@ -1,4 +1,4 @@
-# XAUUSD Meta-Policy System — v0.3
+# XAUUSD Meta-Policy System — v0.4
 
 Rule-based signal engine + DSAC meta-policy for XAUUSD M1.
 No frozen encoder. No external ML framework at runtime. No ZMQ library in MT5.
@@ -10,8 +10,8 @@ No frozen encoder. No external ML framework at runtime. No ZMQ library in MT5.
 ```
 Investing.com calendar  →  Calendar parser (Python)  →  session_context.json
                                                                ↓
-MT5 OHLCV bars  →  MT5 native socket  →  Rust signal server  →  118D obs vector
-                                              ↓                      ↓
+MT5 OHLCV bars  →  MT5 native SocketCreate  →  Rust TcpListener  →  118D obs vector
+                   (newline-delimited JSON)         ↓                      ↓
                                         Scattering (CPU)       ndarray actor
                                         Hurst DFA              (DSAC weights)
                                         TDA Wasserstein              ↓
@@ -25,6 +25,13 @@ MT5 OHLCV bars  →  MT5 native socket  →  Rust signal server  →  118D obs v
                                     DSAC training pipeline
                                               ↓
                                     Updated actor weights → server restart
+
+Backtest path (Option 2):
+MT5 ExportBars.mq5 → XAUUSD_M1_bars.csv
+                              ↓
+         signal_server replay --bars ... --out signals.csv
+                              ↓
+         XAUUSD_Meta.mq5 (SIGNALS_CSV input) → Strategy Tester display
 ```
 
 ---
@@ -34,11 +41,13 @@ MT5 OHLCV bars  →  MT5 native socket  →  Rust signal server  →  118D obs v
 | Component | Language | Status | Notes |
 |-----------|----------|--------|-------|
 | Calendar parser | Python | ✓ Running | Investing.com ec_events_sitemap |
-| Rust signal server | Rust | ✓ Built | ndarray actor, ZMQ REP socket |
+| Rust signal server | Rust | ✓ Built | TcpListener, newline-delimited JSON, no ZMQ |
 | DSAC pre-training | Python | ✓ Done | BC+RL, stable convergence |
 | Actor weights | JSON | ✓ Exported | actor_weights.json ~380KB |
-| MT5 indicator | MQL5 | ✓ Compiled | Native sockets, no ZMQ library |
-| TCP server migration | Rust | ⏳ Pending | ZMQ REP → std::net::TcpListener |
+| MT5 indicator | MQL5 | ✓ Compiled | Native SocketCreate, no ZMQ library |
+| MT5 ExportBars script | MQL5 | ✓ Done | CopyRates → CSV for replay |
+| Rust replay mode | Rust | ✓ Done | `signal_server replay --bars ... --out ...` |
+| MT5 backtest CSV mode | MQL5 | ✓ Done | SIGNALS_CSV input in Strategy Tester |
 | Rust scattering kernel | Rust | Phase 2 | CPU version active in PoC |
 | Scala data pipeline | Scala | Phase 2 | |
 | Multi-user aggregation | FastAPI | Phase 3 | |
@@ -111,7 +120,7 @@ Used for DSAC training once ≥500 overrides accumulate.
 
 ---
 
-## Quick start
+## Quick start — live trading
 
 See `docs/BUILD.md` for full setup instructions.
 
@@ -122,12 +131,32 @@ cd rust_signal_server && cargo build --release -j1
 # 2. Start calendar parser (background)
 python calendar\parser.py --out "...\Common\Files\session_context.json" --schedule
 
-# 3. Start signal server
-.\rust_signal_server\target\release\signal_server.exe ^
-    --bind tcp://127.0.0.1:5555 ^
-    --actor models\actor_weights.json
+# 3. Start signal server (TCP, no ZMQ)
+.\rust_signal_server\target\release\signal_server.exe --bind 127.0.0.1:5555 --actor models\actor_weights.json
 
 # 4. Compile and attach XAUUSD_Meta.mq5 in MetaEditor
+#    Inputs: SERVER_HOST=127.0.0.1  SERVER_PORT=5555
+```
+
+## Quick start — backtest (Option 2)
+
+```bash
+# 1. In MT5: compile ExportBars.mq5, drag onto XAUUSD M1 chart
+#    Set FROM_DATE / TO_DATE, runs → writes Common\Files\XAUUSD_M1_bars.csv
+
+# 2. Run Rust replay (full signal pipeline, no live connection needed)
+.\rust_signal_server\target\release\signal_server.exe replay ^
+    --bars "C:\Users\<user>\AppData\Roaming\MetaQuotes\Terminal\Common\Files\XAUUSD_M1_bars.csv" ^
+    --out  signals.csv ^
+    --actor models\actor_weights.json
+
+# 3. In MT5 Strategy Tester: attach XAUUSD_Meta.mq5
+#    Set SIGNALS_CSV = <full path to signals.csv>
+#    Tester displays full-fidelity signals (Hurst, TDA, actor) from pre-computed file
+#
+# Note: pos_dir / unrealized / hold_fraction are 0 in replay (flat-position assumption).
+#       Rule-based signal and actor entry signals are fully accurate.
+#       Position-management quality requires live or Python simulation.
 ```
 
 ---

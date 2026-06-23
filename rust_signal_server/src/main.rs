@@ -1,17 +1,19 @@
-//! XAUUSD signal server v0.2 — ZeroMQ REP socket.
-//! Adds DSAC actor inference via Candle alongside the rule-based signal engine.
+//! XAUUSD signal server v0.3 — std::net::TcpListener (no ZMQ).
 //!
-//! Protocol unchanged — response now includes actor_dir and actor_exit fields.
+//! Newline-delimited JSON over a persistent TCP connection.
+//! MT5 connects once; each bar sends one JSON line, receives one JSON line.
 //!
-//! Run:
-//!   ./signal_server --bind tcp://127.0.0.1:5555 --actor models/dsac_pretrained.pt
-//!
-//! Actor is optional — omit --actor to run rule-based only (PoC default).
+//! Modes:
+//!   serve   (default)  ./signal_server [--bind 127.0.0.1:5555] [--actor models/actor_weights.json]
+//!   replay             ./signal_server replay --bars historical.csv --out signals.csv [--actor ...]
 
 use anyhow::Result;
 use log::{info, warn};
 use serde::{Deserialize, Serialize};
 use std::env;
+use std::io::{BufRead, BufReader, Write};
+use std::net::TcpListener;
+use std::time::Duration;
 
 mod actor;
 mod indicators;
@@ -38,82 +40,204 @@ struct SignalRequest {
 
 #[derive(Serialize)]
 struct SignalResponse {
-    obs:             Vec<f32>,
-    // Rule-based outputs
-    direction_bias:  f32,
-    signal_strength: f32,
-    sl_pips:         f32,
-    tp_pips:         f32,
-    lot_suggestion:  f32,
-    hurst:           f32,
-    tda_wasserstein: f32,
-    event_risk:      f32,
-    regime:          f32,
-    // Actor outputs (0.0 if no actor loaded)
-    actor_dir:       f32,
-    actor_exit:      f32,
-    actor_confidence:f32,
-    // Final blended decision
-    final_dir:       f32,
-    should_exit:     bool,
+    obs:              Vec<f32>,
+    direction_bias:   f32,
+    signal_strength:  f32,
+    sl_pips:          f32,
+    tp_pips:          f32,
+    lot_suggestion:   f32,
+    hurst:            f32,
+    tda_wasserstein:  f32,
+    event_risk:       f32,
+    regime:           f32,
+    actor_dir:        f32,
+    actor_exit:       f32,
+    actor_confidence: f32,
+    final_dir:        f32,
+    should_exit:      bool,
 }
 
-// ── Main ─────────────────────────────────────────────────────────────────────
+// ── Entry point ───────────────────────────────────────────────────────────────
 fn main() -> Result<()> {
     env_logger::Builder::from_env(
         env_logger::Env::default().default_filter_or("info")
     ).init();
 
     let args: Vec<String> = env::args().collect();
-    let bind_addr = arg_value(&args, "--bind")
-        .unwrap_or_else(|| "tcp://127.0.0.1:5555".into());
-    let actor_path = arg_value(&args, "--actor");
 
-    // Load actor (optional)
-    let actor: Option<DsacActor> = match &actor_path {
-        Some(path) => {
-            match DsacActor::load(path) {
-                Ok(a) => {
-                    info!("DSAC actor loaded: {}", path);
-                    Some(a)
-                }
-                Err(e) => {
-                    warn!("Failed to load actor from {}: {} — running rule-only", path, e);
-                    None
-                }
-            }
-        }
-        None => {
-            info!("No --actor path provided — running rule-based signal only");
-            None
-        }
-    };
+    if args.get(1).map(|s| s.as_str()) == Some("replay") {
+        return run_replay(&args);
+    }
+    run_server(&args)
+}
 
-    let ctx    = zmq::Context::new();
-    let socket = ctx.socket(zmq::REP)?;
-    socket.bind(&bind_addr)?;
-    info!("Signal server listening on {}", bind_addr);
+// ── Actor loader ──────────────────────────────────────────────────────────────
+fn load_actor(path: Option<String>) -> Option<DsacActor> {
+    match path {
+        Some(p) => match DsacActor::load(&p) {
+            Ok(a)  => { info!("DSAC actor loaded: {}", p); Some(a) }
+            Err(e) => { warn!("Actor load failed: {} — rule-only", e); None }
+        }
+        None => { info!("No --actor provided — rule-based signal only"); None }
+    }
+}
+
+// ── Live TCP server ───────────────────────────────────────────────────────────
+fn run_server(args: &[String]) -> Result<()> {
+    let bind_raw = arg_value(args, "--bind")
+        .unwrap_or_else(|| "127.0.0.1:5555".into());
+    // Accept both "127.0.0.1:5555" and legacy "tcp://127.0.0.1:5555"
+    let bind_addr = bind_raw
+        .strip_prefix("tcp://")
+        .unwrap_or(&bind_raw)
+        .to_string();
+
+    let actor = load_actor(arg_value(args, "--actor"));
+
+    let listener = TcpListener::bind(&bind_addr)?;
+    info!("Signal server listening on {} (TCP)", bind_addr);
     info!("Actor: {}", if actor.is_some() { "loaded" } else { "rule-only" });
 
-    let scatter = ScatterBlock::new();
-    let mut tda = WassersteinTracker::new(60);
+    let scatter  = ScatterBlock::new();
+    let mut tda  = WassersteinTracker::new(60);
 
-    loop {
-        let msg = socket.recv_bytes(0)?;
-        match handle_request(&msg, &scatter, &mut tda, &actor) {
-            Ok(resp) => {
-                let out = serde_json::to_vec(&resp)?;
-                socket.send(out, 0)?;
+    'accept: loop {
+        let (stream, addr) = listener.accept()?;
+        info!("MT5 connected from {}", addr);
+        stream.set_read_timeout(Some(Duration::from_secs(30)))?;
+
+        let mut writer = stream.try_clone()?;
+        let mut reader = BufReader::new(stream);
+        let mut line   = String::new();
+
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0)  => { info!("MT5 disconnected"); continue 'accept; }
+                Ok(_)  => {}
+                Err(e) => { warn!("Read error: {}", e); continue 'accept; }
             }
-            Err(e) => {
-                warn!("Request error: {}", e);
-                let err = serde_json::json!({"error": e.to_string()});
-                socket.send(serde_json::to_vec(&err)?, 0)?;
+
+            match handle_request(line.trim().as_bytes(), &scatter, &mut tda, &actor) {
+                Ok(resp) => {
+                    let mut out = serde_json::to_vec(&resp)?;
+                    out.push(b'\n');
+                    if let Err(e) = writer.write_all(&out) {
+                        warn!("Write error: {}", e);
+                        continue 'accept;
+                    }
+                }
+                Err(e) => {
+                    warn!("Request error: {}", e);
+                    let mut err = serde_json::to_vec(
+                        &serde_json::json!({"error": e.to_string()})
+                    )?;
+                    err.push(b'\n');
+                    let _ = writer.write_all(&err);
+                }
             }
         }
     }
 }
 
+// ── Offline replay ────────────────────────────────────────────────────────────
+//
+// Input CSV columns  : datetime,open,high,low,close,tick_volume
+// Output CSV columns : datetime,direction_bias,signal_strength,final_dir,
+//                      should_exit,hurst,tda_wasserstein,regime,actor_dir,
+//                      actor_confidence,sl_pips,tp_pips,lot_suggestion
+//
+// pos_dir / unrealized / hold_fraction are held at 0 (flat-position assumption).
+// TDA tracker is stateful and processes bars in sequence — do not shuffle input.
+fn run_replay(args: &[String]) -> Result<()> {
+    let bars_path = arg_value(args, "--bars")
+        .ok_or_else(|| anyhow::anyhow!("--bars <path> required for replay"))?;
+    let out_path  = arg_value(args, "--out")
+        .ok_or_else(|| anyhow::anyhow!("--out <path> required for replay"))?;
+
+    let actor   = load_actor(arg_value(args, "--actor"));
+    let scatter = ScatterBlock::new();
+    let mut tda = WassersteinTracker::new(60);
+
+    let content = std::fs::read_to_string(&bars_path)?;
+    let mut lines = content.lines();
+    let _header = lines.next(); // skip header
+
+    let mut window: Vec<[f32; 8]> = Vec::with_capacity(SEQ_LEN);
+    let mut out   = std::fs::File::create(&out_path)?;
+
+    writeln!(out,
+        "datetime,direction_bias,signal_strength,final_dir,should_exit,\
+         hurst,tda_wasserstein,regime,actor_dir,actor_confidence,\
+         sl_pips,tp_pips,lot_suggestion")?;
+
+    let (mut bar_n, mut sig_n) = (0u64, 0u64);
+
+    for raw in lines {
+        // Columns: datetime,open,high,low,close,tick_volume[,...]
+        let f: Vec<&str> = raw.splitn(7, ',').collect();
+        if f.len() < 6 { continue; }
+
+        let datetime = f[0].trim();
+        let open  = f[1].trim().parse::<f32>().unwrap_or(0.0);
+        let high  = f[2].trim().parse::<f32>().unwrap_or(0.0);
+        let low   = f[3].trim().parse::<f32>().unwrap_or(0.0);
+        let close = f[4].trim().parse::<f32>().unwrap_or(0.0);
+        let vol   = f[5].trim().parse::<f32>().unwrap_or(0.0);
+        if close <= 0.0 { continue; }
+
+        // Derive session_phase from bar datetime; event_risk = 0.0 (no calendar)
+        let session_ph = session_phase_from_dt(datetime);
+        let bar: [f32; 8] = [open, high, low, close, vol, 0.0, session_ph, 0.0];
+
+        if window.len() == SEQ_LEN { window.remove(0); }
+        window.push(bar);
+        bar_n += 1;
+
+        if window.len() < SEQ_LEN { continue; }
+
+        let req_json = serde_json::json!({
+            "bars":          window,
+            "pos_dir":       0.0_f32,
+            "unrealized":    0.0_f32,
+            "hold_fraction": 0.0_f32
+        });
+        let req_bytes = serde_json::to_vec(&req_json)?;
+
+        match handle_request(&req_bytes, &scatter, &mut tda, &actor) {
+            Ok(r) => {
+                writeln!(out,
+                    "{},{:.4},{:.4},{:.4},{},{:.4},{:.4},{:.4},{:.4},{:.4},{:.2},{:.2},{:.3}",
+                    datetime,
+                    r.direction_bias, r.signal_strength, r.final_dir,
+                    r.should_exit as u8,
+                    r.hurst, r.tda_wasserstein, r.regime,
+                    r.actor_dir, r.actor_confidence,
+                    r.sl_pips, r.tp_pips, r.lot_suggestion,
+                )?;
+                sig_n += 1;
+            }
+            Err(e) => warn!("Replay bar {}: {}", datetime, e),
+        }
+    }
+
+    info!("Replay done — {} bars in, {} rows out → {}", bar_n, sig_n, out_path);
+    Ok(())
+}
+
+/// Parse session phase from MT5 datetime string "2026.01.01 00:00" or "2026.01.01 00:00:00".
+fn session_phase_from_dt(dt: &str) -> f32 {
+    let hour: u32 = dt.splitn(2, ' ')
+        .nth(1)
+        .and_then(|t| t.splitn(2, ':').next())
+        .and_then(|h| h.parse().ok())
+        .unwrap_or(0);
+    if hour < 8  { 0.0 }
+    else if hour < 13 { 0.5 }
+    else { 1.0 }
+}
+
+// ── Core signal pipeline ──────────────────────────────────────────────────────
 fn handle_request(
     raw:     &[u8],
     scatter: &ScatterBlock,
@@ -131,27 +255,19 @@ fn handle_request(
     let session: Vec<f32> = req.bars.iter().map(|b| b[6]).collect();
     let event_risk = req.bars.last().map(|b| b[7]).unwrap_or(0.0);
 
-    // ── Scattering (104D) ─────────────────────────────────────────────────
     let scatter_feats = scatter.forward(&req.bars);
-
-    // ── Indicators (10D) ──────────────────────────────────────────────────
     let ind = Indicators::compute(&close, &high, &low, &volume, &session, event_risk);
 
-    // ── TDA (1D) ──────────────────────────────────────────────────────────
     let log_ret: Vec<f32> = close.windows(2)
         .map(|w| (w[1] / w[0].max(1e-8)).ln())
         .collect();
-    let tda_w = tda.update(&log_ret);
-
-    // ── Regime ────────────────────────────────────────────────────────────
+    let tda_w  = tda.update(&log_ret);
     let regime = regime::bear_bull_proxy(&close, &volume);
 
-    // ── Rule-based signal ─────────────────────────────────────────────────
     let (rule_dir, strength) = meta_policy_signal(&ind, tda_w, event_risk, regime);
     let atr_last = ind.atr;
     let (sl_pips, tp_pips, lot) = size_trade(rule_dir, strength, atr_last, event_risk);
 
-    // ── Assemble 118D obs ─────────────────────────────────────────────────
     let unreal_norm = (req.unrealized / atr_last.max(1e-8)).tanh();
     let mut obs = Vec::with_capacity(OBS_DIM);
     obs.extend_from_slice(&scatter_feats);
@@ -168,24 +284,16 @@ fn handle_request(
     obs.push(req.pos_dir);
     obs.push(unreal_norm);
     obs.push(req.hold_fraction);
-    obs.push(strength);   // conf_proxy
-    // total = 118
+    obs.push(strength);
 
-    // ── Actor inference (optional) ────────────────────────────────────────
     let (actor_dir, actor_exit, actor_confidence, final_dir, should_exit) =
         match actor {
-            Some(a) => {
-                match a.forward(&obs) {
-                    Ok((ad, ae)) => {
-                        let (fd, se, conf) =
-                            actor_decision(rule_dir, ad, ae, strength);
-                        (ad, ae, conf, fd, se)
-                    }
-                    Err(e) => {
-                        warn!("Actor forward failed: {}", e);
-                        (0.0, 0.0, strength, rule_dir, false)
-                    }
+            Some(a) => match a.forward(&obs) {
+                Ok((ad, ae)) => {
+                    let (fd, se, conf) = actor_decision(rule_dir, ad, ae, strength);
+                    (ad, ae, conf, fd, se)
                 }
+                Err(e) => { warn!("Actor forward failed: {}", e); (0.0, 0.0, strength, rule_dir, false) }
             }
             None => (0.0, 0.0, strength, rule_dir, false),
         };
@@ -194,8 +302,7 @@ fn handle_request(
         obs,
         direction_bias:  rule_dir,
         signal_strength: strength,
-        sl_pips,
-        tp_pips,
+        sl_pips, tp_pips,
         lot_suggestion:  lot,
         hurst:           ind.hurst,
         tda_wasserstein: tda_w,
@@ -209,7 +316,7 @@ fn handle_request(
     })
 }
 
-// ── Rule-based meta-policy (unchanged from v0.1) ──────────────────────────────
+// ── Rule-based meta-policy ────────────────────────────────────────────────────
 fn meta_policy_signal(
     ind:        &Indicators,
     tda_w:      f32,
@@ -238,8 +345,7 @@ fn meta_policy_signal(
     ];
     let n_sell: f32 = sell_votes.iter().map(|&v| v as u8 as f32).sum();
     let n_buy:  f32 = buy_votes.iter().map(|&v| v as u8 as f32).sum();
-    let hurst_ok = ind.hurst > 0.50;
-    let thresh   = if hurst_ok { 3.0 } else { 4.0 };
+    let thresh  = if ind.hurst > 0.50 { 3.0 } else { 4.0 };
 
     if n_sell >= thresh && n_sell > n_buy {
         (-1.0, n_sell / 5.0)

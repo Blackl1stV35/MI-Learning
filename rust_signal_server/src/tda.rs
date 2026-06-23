@@ -23,14 +23,23 @@ impl WassersteinTracker {
         let n = log_ret.len();
         if n < self.window { return 0.0; }
         let slice = &log_ret[n - self.window..];
-        let dgm   = h0_persistence(slice, 3);   // delay dim=3
-        let dist  = if self.prev_dgm.is_empty() {
+
+        // Z-score normalise so point-cloud distances are scale-invariant.
+        // Raw M1 log returns are ~1e-4; without this step tanh rounds to 0.
+        let mean = slice.iter().sum::<f32>() / slice.len() as f32;
+        let std  = (slice.iter().map(|x| (x - mean).powi(2)).sum::<f32>()
+                    / slice.len() as f32).sqrt().max(1e-8);
+        let normed: Vec<f32> = slice.iter().map(|x| (x - mean) / std).collect();
+
+        let dgm  = h0_persistence(&normed, 3);
+        let dist = if self.prev_dgm.is_empty() {
             0.0
         } else {
             wasserstein1(&dgm, &self.prev_dgm)
         };
         self.prev_dgm = dgm;
-        dist.tanh()   // bounded [0,1]
+        // With unit-std inputs typical distances are O(1-5); scale 0.1 spreads [0,1]
+        (dist * 0.1).tanh()
     }
 }
 

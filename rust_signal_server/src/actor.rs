@@ -67,12 +67,24 @@ fn tanh_vec(x: Array1<f32>) -> Array1<f32> {
 }
 
 /// Blend rule-based and actor signals into final decision.
+///
+/// Saturation guard: if both actor outputs are at the tanh rail (|x| > 0.98)
+/// the actor is out-of-distribution (synthetic pretrain vs live scatter features).
+/// Fall back to pure rule signal until the actor is retrained on override data.
 pub fn actor_decision(
     rule_dir:   f32,
     actor_dir:  f32,
     actor_exit: f32,
     strength:   f32,
 ) -> (f32, bool, f32) {
+    let saturated = actor_dir.abs() > 0.98 && actor_exit.abs() > 0.98;
+    if saturated {
+        let final_dir = if rule_dir > 0.25 { 1.0 }
+                        else if rule_dir < -0.25 { -1.0 }
+                        else { 0.0 };
+        return (final_dir, false, strength);
+    }
+
     let rule_w  = (strength * 2.0).clamp(0.0, 1.0);
     let blended = rule_dir * rule_w + actor_dir * (1.0 - rule_w);
     let final_dir = if blended > 0.25 { 1.0 }

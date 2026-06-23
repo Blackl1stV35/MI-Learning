@@ -3,3 +3,6 @@ zmq.dll
 data/
 models/
 rust_signal_server/target/
+
+*.csv
+*.set
