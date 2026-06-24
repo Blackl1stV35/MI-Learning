@@ -1,66 +1,70 @@
 # XAUUSD Meta-Policy System — v0.4
 
-Rule-based signal engine + DSAC meta-policy for XAUUSD M1.
-No frozen encoder. No external ML framework at runtime. No ZMQ library in MT5.
+Rule-based 5-vote signal engine fused with a BC-trained DSAC actor for XAUUSD M1.
+Runs fully local: no cloud, no ZMQ, no frozen encoder at runtime.
 
 ---
 
 ## Architecture
 
 ```
-Investing.com calendar  →  Calendar parser (Python)  →  session_context.json
-                                                               ↓
-MT5 OHLCV bars  →  MT5 native SocketCreate  →  Rust TcpListener  →  118D obs vector
-                   (newline-delimited JSON)         ↓                      ↓
-                                        Scattering (CPU)       ndarray actor
-                                        Hurst DFA              (DSAC weights)
-                                        TDA Wasserstein              ↓
-                                        Rule-based signal     final_dir + should_exit
-                                              ↓
-                                    MT5 Indicator display
-                                    (no execution — user decides)
-                                              ↓ (overrides only)
-                                    override_log.csv
-                                              ↓ (≥500 overrides)
-                                    DSAC training pipeline
-                                              ↓
-                                    Updated actor weights → server restart
+MT5 OHLCV bars (240 M1 bars per request)
+        │
+        │  HTTP POST  (WebRequest — broker-safe fallback when raw TCP blocked)
+        ▼
+Rust TcpListener 127.0.0.1:5555  ←── also accepts raw newline-JSON (TCP direct)
+        │
+        ├── Morlet scattering  (104D, CPU)
+        ├── Hurst DFA  +  TDA Wasserstein  +  ATR / RSI / BB / VWAP
+        ├── Rule-based meta-policy  (5-vote, gates: event_risk / TDA / bull-low)
+        └── DSAC actor  (BC-trained, 118D obs, obs z-score normalisation built-in)
+                │
+                ▼
+        final_dir  ·  sl_pips  ·  tp_pips  ·  lot_suggestion  ·  should_exit
+                │
+        ┌───────┴────────┐
+        ▼                ▼
+AutoTradeEA.mq5      XAUUSD_Meta.mq5
+(live execution)     (indicator overlay, override log)
+        │
+        ▼
+position_log.csv  →  live_dashboard.py (localhost:8080)
 
-Backtest path (Option 2):
-MT5 ExportBars.mq5 → XAUUSD_M1_bars.csv
-                              ↓
-         signal_server replay --bars ... --out signals.csv
-                              ↓
-         XAUUSD_Meta.mq5 (SIGNALS_CSV input) → Strategy Tester display
+Offline retrain path:
+ExportBars.mq5 → XAUUSD_M1_bars.csv
+    → signal_server replay --obs-out signals_obs.bin
+    → train_offline.py  (BC warmup 10K + optional DSAC)
+    → actor_weights.json  (with obs_mean / obs_std embedded)
 ```
 
 ---
 
 ## Component status
 
-| Component | Language | Status | Notes |
-|-----------|----------|--------|-------|
-| Calendar parser | Python | ✓ Running | Investing.com ec_events_sitemap |
-| Rust signal server | Rust | ✓ Built | TcpListener, newline-delimited JSON, no ZMQ |
-| DSAC pre-training | Python | ✓ Done | BC+RL, stable convergence |
-| Actor weights | JSON | ✓ Exported | actor_weights.json ~380KB |
-| MT5 indicator | MQL5 | ✓ Compiled | Native SocketCreate, no ZMQ library |
-| MT5 ExportBars script | MQL5 | ✓ Done | CopyRates → CSV for replay |
-| Rust replay mode | Rust | ✓ Done | `signal_server replay --bars ... --out ...` |
-| MT5 backtest CSV mode | MQL5 | ✓ Done | SIGNALS_CSV input in Strategy Tester |
-| Rust scattering kernel | Rust | Phase 2 | CPU version active in PoC |
-| Scala data pipeline | Scala | Phase 2 | |
-| Multi-user aggregation | FastAPI | Phase 3 | |
-| C++ encoder | C++ | Gated | Requires Run 15 sell_P ≥ 0.302 |
+| Component | Status | Notes |
+|-----------|--------|-------|
+| Rust signal server | ✅ Live | HTTP POST + raw JSON on same port 5555 |
+| DSAC actor | ✅ Deployed | BC-trained on 99,761 real M1 bars (Jan–Jun 2026) |
+| Obs normalisation | ✅ Active | obs_mean/obs_std embedded in actor_weights.json |
+| AutoTradeEA.mq5 | ✅ Live | HTTP mode; SELL at 4081.45 confirmed 2026-06-24 |
+| XAUUSD_Meta.mq5 | ✅ Live | HTTP fallback + overlay panel + override_log |
+| start_live.ps1 | ✅ Ready | Launches server, waits for LISTENING, tails log |
+| live_dashboard.py | ✅ Ready | localhost:8080 — signal chart, position, stats |
+| Rust replay mode | ✅ Ready | `replay --bars ... --out ... --obs-out ...` |
+| train_offline.py | ✅ Ready | BC warmup → BC checkpoint (DSAC diverges offline) |
+| MT5 ExportBars script | ✅ Ready | CopyRates → CSV for replay / training |
+| Scala data pipeline | Phase 2 | |
+| Multi-user aggregation | Phase 3 | |
 
 ---
 
 ## Observation vector (118D)
 
 ```
-[0:104]   Scattering coefficients — 8ch × 12 Morlet filters + 8 lowpass
-[104]     atr_ratio       tanh((close-prev)/ATR)
-[105]     vwap_dev        tanh((close-session_vwap)/ATR)
+[0:104]   Morlet scattering coefficients — raw price scale (~2500–5000 USD/oz)
+          z-score normalised at inference via obs_mean/obs_std in actor_weights.json
+[104]     atr_ratio       tanh((close−prev) / ATR)
+[105]     vwap_dev        tanh((close−session_vwap) / ATR)
 [106]     rsi_63          RSI(63) normalised [0,1]
 [107]     bb_pctb         Bollinger %B [0,1]
 [108]     vol_zscore      tanh(rolling z-score volume, w=120)
@@ -69,7 +73,7 @@ MT5 ExportBars.mq5 → XAUUSD_M1_bars.csv
 [111]     session_phase   0.0=Asian / 0.5=London / 1.0=NY
 [112]     event_risk      0.0=low / 0.5=medium / 1.0=high
 [113]     regime          0.0=Bear / 1.0=Bull (SMA+volume proxy)
-[114]     pos_dir         current position: -1/0/+1
+[114]     pos_dir         current position −1 / 0 / +1
 [115]     unrealized_norm tanh(unrealized_pnl / ATR)
 [116]     hold_fraction   bars_held / max_hold [0,1]
 [117]     conf_proxy      signal convergence score [0,1]
@@ -77,86 +81,121 @@ MT5 ExportBars.mq5 → XAUUSD_M1_bars.csv
 
 ---
 
-## DSAC actor architecture
+## DSAC actor
 
 ```
 Linear(118→512) → ReLU → Linear(512→256) → ReLU → Linear(256→2) → Tanh
-Output[0]: direction_bias  (-1=sell, 0=hold, +1=buy)
-Output[1]: exit_logit      (< -0.1 = suggest exit)
+Output[0]: actor_dir   (−1=sell, 0=hold, +1=buy)
+Output[1]: actor_exit  (< −0.1 → suggest exit)
 ```
 
-Pre-trained via:
-- Phase 1 (10k steps): behavioural cloning on synthetic buffer
-- Phase 2 (10k steps): RL fine-tuning against stable double-Q critic
-- Convergence: q_loss ~0.00013, a_loss ~-0.024 (stable, not diverging)
+**Training history:**
+- Pre-train (synthetic, v0.3): saturated at tanh=−1 on real obs → 100% dead gradient
+- Root cause: scatter obs[0:104] = raw price ~2500–5000 USD/oz; Kaiming init → first layer ≈ 2943 → tanh clips
+- Fix: z-score normalisation (obs_mean/obs_std computed on 99,761 real bars, embedded in JSON)
+- BC warmup (10K steps, lr=1e-3, soft targets ±0.7): loss 2.5 → 0.00001, saturation 0% → 0%
+- DSAC fine-tune: diverges offline (fresh critics + no conservative constraint → Q overestimation)
+- **Deployed: BC checkpoint** — actor_dir tracks rule-engine at ±0.70 with 0% saturation
 
 ---
 
 ## Meta-policy signal logic
 
 ```
-Gate 1: event_risk ≥ 1.0  → HOLD (high-impact event window)
-Gate 2: tda_wasserstein > 0.35 → HOLD (regime transition in progress)
-Gate 3: Bull + LOW vol → suppress SELL (Bull-LOW filter from paper trade)
+Gate 1: event_risk ≥ 1.0        → HOLD (high-impact news window)
+Gate 2: tda_wasserstein > 0.35   → HOLD (regime transition detected)
+Gate 3: Bull regime + vol < −0.3 → suppress SELL
 
-Signal convergence votes (need ≥3 if H>0.5, else ≥4):
-  SELL votes: rsi<0.35, bb<0.25, atr_ratio<-0.1, vwap_dev<-0.15, Bear
-  BUY  votes: rsi>0.65, bb>0.75, atr_ratio>0.1,  vwap_dev>0.15,  Bull
+Vote threshold: ≥3 votes if Hurst > 0.50 (trending), else ≥4 (mean-reverting)
 
-Actor blend: final_dir = rule_dir×rule_weight + actor_dir×(1-rule_weight)
-  rule_weight = clamp(strength×2, 0, 1)
+SELL votes: rsi<0.35  bb<0.25  atr_ratio<−0.1  vwap_dev<−0.15  Bear
+BUY  votes: rsi>0.65  bb>0.75  atr_ratio>0.1   vwap_dev>0.15   Bull
+
+final_dir: actor_dir blended with rule_dir when |actor_dir| > threshold
 ```
 
 ---
 
-## Override log columns
+## MT5 broker socket restriction (err 4014)
 
-```
-timestamp, symbol, rule_dir, final_dir, actor_dir, strength,
-user_dir, user_lot, hurst, tda_w, event_risk, regime, event_type
-```
+Some brokers block `SocketConnect` to localhost (`ERR_FUNCTION_NOT_ALLOWED`).
+Both EAs auto-detect this on the first connection attempt and switch to
+`WebRequest` (MT5's internal HTTP stack, which is not blocked).
 
-Used for DSAC training once ≥500 overrides accumulate.
+**One-time setup required:**
+`Tools → Options → Expert Advisors → Allow WebRequest for listed URL`
+Add: `http://127.0.0.1:5555`
+
+The server handles both protocols on the same port — no config change needed.
 
 ---
 
 ## Quick start — live trading
 
-See `docs/BUILD.md` for full setup instructions.
+```powershell
+# 1. Build Rust server
+cd rust_signal_server
+cargo build --release
 
-```bash
-# 1. Build
-cd rust_signal_server && cargo build --release -j1
+# 2. Start signal server + tail log
+.\start_live.ps1
 
-# 2. Start calendar parser (background)
-python calendar\parser.py --out "...\Common\Files\session_context.json" --schedule
+# 3. In MT5:
+#    Tools → Options → Expert Advisors → Allow WebRequest → add http://127.0.0.1:5555
+#    MetaEditor F7 → compile AutoTradeEA.mq5 (0 errors)
+#    Drag AutoTradeEA onto XAUUSD M1 chart (not H1)
+#    MetaEditor F7 → compile XAUUSD_Meta.mq5
+#    Insert XAUUSD_Meta indicator on same XAUUSD M1 chart
 
-# 3. Start signal server (TCP, no ZMQ)
-.\rust_signal_server\target\release\signal_server.exe --bind 127.0.0.1:5555 --actor models\actor_weights.json
-
-# 4. Compile and attach XAUUSD_Meta.mq5 in MetaEditor
-#    Inputs: SERVER_HOST=127.0.0.1  SERVER_PORT=5555
-```
-
-## Quick start — backtest (Option 2)
-
-```bash
-# 1. In MT5: compile ExportBars.mq5, drag onto XAUUSD M1 chart
-#    Set FROM_DATE / TO_DATE, runs → writes Common\Files\XAUUSD_M1_bars.csv
-
-# 2. Run Rust replay (full signal pipeline, no live connection needed)
-.\rust_signal_server\target\release\signal_server.exe replay ^
-    --bars "C:\Users\<user>\AppData\Roaming\MetaQuotes\Terminal\Common\Files\XAUUSD_M1_bars.csv" ^
-    --out  signals.csv ^
-    --actor models\actor_weights.json
-
-# 3. In MT5 Strategy Tester: attach XAUUSD_Meta.mq5
-#    Set SIGNALS_CSV = <full path to signals.csv>
-#    Tester displays full-fidelity signals (Hurst, TDA, actor) from pre-computed file
-#
-# Note: pos_dir / unrealized / hold_fraction are 0 in replay (flat-position assumption).
-#       Rule-based signal and actor entry signals are fully accurate.
-#       Position-management quality requires live or Python simulation.
+# 4. Monitor
+python live_dashboard.py     # opens http://localhost:8080
 ```
 
 ---
+
+## Quick start — offline retrain
+
+```powershell
+# 1. Export bars from MT5 (compile + run ExportBars.mq5 on XAUUSD M1)
+#    Output: Common\Files\XAUUSD_M1_bars.csv
+
+# 2. Run replay to get signals + 118D obs binary
+.\rust_signal_server\target\release\signal_server.exe replay `
+    --bars  "$env:APPDATA\MetaQuotes\Terminal\Common\Files\XAUUSD_M1_bars.csv" `
+    --out   "$env:APPDATA\MetaQuotes\Terminal\Common\Files\signals.csv" `
+    --obs-out "$env:APPDATA\MetaQuotes\Terminal\Common\Files\signals_obs.bin" `
+    --actor models\actor_weights.json
+
+# 3. Retrain actor via BC warmup
+python train_offline.py
+# Output: models/actor_weights.json (includes obs_mean/obs_std)
+
+# 4. Restart server to pick up new weights
+.\start_live.ps1
+```
+
+---
+
+## Key files
+
+| File | Purpose |
+|------|---------|
+| `rust_signal_server/src/main.rs` | TCP server, HTTP handler, replay mode |
+| `rust_signal_server/src/actor.rs` | DSAC actor inference + obs normalisation |
+| `models/actor_weights.json` | BC-trained weights + obs_mean/obs_std (~3.9 MB) |
+| `train_offline.py` | BC warmup + optional DSAC fine-tuning |
+| `mql5/AutoTradeEA.mq5` | Live auto-executor (HTTP fallback, position_log) |
+| `mql5/XAUUSD_Meta.mq5` | Signal overlay indicator (HTTP fallback, override_log) |
+| `mql5/ExportBars.mq5` | MT5 script: CopyRates → CSV |
+| `start_live.ps1` | Server launcher + log tail |
+| `live_dashboard.py` | localhost:8080 monitoring dashboard |
+
+## Log / output files (MT5 Common\Files)
+
+| File | Written by | Content |
+|------|-----------|---------|
+| `position_log.csv` | AutoTradeEA | per-bar: pos_dir, hold_frac, unrealized, action |
+| `override_log.csv` | XAUUSD_Meta | trades that diverged from final_dir signal |
+| `signals.csv` | Rust replay | per-bar signal (rule + actor) for backtesting |
+| `signals_obs.bin` | Rust replay `--obs-out` | 118D obs binary for retraining |
+| `XAUUSD_M1_bars.csv` | ExportBars.mq5 | raw OHLCV for replay / training |
