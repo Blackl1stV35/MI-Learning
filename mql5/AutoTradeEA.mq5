@@ -63,6 +63,11 @@ double          g_pos_dir       = 0.0;   // +1=long, -1=short, 0=flat
 
 datetime        g_prev_bar_time = 0;
 
+//-- Momentum-exit indicator handles (persistent — created once in OnInit)
+int             g_rsi_handle    = INVALID_HANDLE;
+int             g_bb_handle     = INVALID_HANDLE;
+int             g_matr_handle   = INVALID_HANDLE;
+
 //+------------------------------------------------------------------+
 
 int OnInit() {
@@ -80,6 +85,13 @@ int OnInit() {
     FileWrite(g_log_handle,
         "datetime", "pos_dir", "hold_frac", "unrealized_norm",
         "signal_dir", "action_taken", "entry_price", "sl_price", "tp_price");
+
+    //-- Momentum-exit indicators (used in both live and tester modes)
+    g_rsi_handle  = iRSI(Symbol(),   PERIOD_M1, 63, PRICE_CLOSE);
+    g_bb_handle   = iBands(Symbol(), PERIOD_M1, 20, 0, 2.0, PRICE_CLOSE);
+    g_matr_handle = iATR(Symbol(),   PERIOD_M1, 14);
+    if(g_rsi_handle == INVALID_HANDLE || g_bb_handle == INVALID_HANDLE || g_matr_handle == INVALID_HANDLE)
+        Print("AutoTradeEA: WARNING — momentum-exit indicator init failed (err=", GetLastError(), ")");
 
     if(g_is_tester) {
         if(!LoadPrecomp()) {
@@ -106,6 +118,9 @@ void OnDeinit(const int reason) {
         SocketClose(g_socket);
         g_socket = INVALID_HANDLE;
     }
+    if(g_rsi_handle  != INVALID_HANDLE) { IndicatorRelease(g_rsi_handle);  g_rsi_handle  = INVALID_HANDLE; }
+    if(g_bb_handle   != INVALID_HANDLE) { IndicatorRelease(g_bb_handle);   g_bb_handle   = INVALID_HANDLE; }
+    if(g_matr_handle != INVALID_HANDLE) { IndicatorRelease(g_matr_handle); g_matr_handle = INVALID_HANDLE; }
     Print("AutoTradeEA: stopped. Reason=", reason);
 }
 
@@ -163,6 +178,10 @@ void OnTick() {
         }
     }
 
+    // -- Momentum-exit check (runs in both live and tester modes; uses real bar data
+    //    so fires correctly even when server-side should_exit is from pos_dir=0 replay)
+    bool mom_exit = MomentumExitSignal(g_pos_dir);
+
     // -- Execute trade decision
     double entry_price = 0, actual_sl = 0, actual_tp = 0;
 
@@ -170,6 +189,9 @@ void OnTick() {
     if(g_pos_dir != 0 && g_hold_bars >= MAX_HOLD_BARS) {
         ClosePosition();
         action_taken = "TIMEOUT";
+    } else if(mom_exit && g_pos_dir != 0) {
+        ClosePosition();
+        action_taken = "MOM_EXIT";
     } else if(should_exit && g_pos_dir != 0) {
         ClosePosition();
         action_taken = "EXIT_SIGNAL";
@@ -215,6 +237,44 @@ void OnTick() {
         );
         FileFlush(g_log_handle);
     }
+}
+
+//+------------------------------------------------------------------+
+//  Momentum-exit rule (mirrors Rust momentum_exit_rule in main.rs)
+//
+//  Validated indicator selection: RSI-63 uses Wilder 35/65 boundaries;
+//  BB%B uses ±2σ (0.20/0.80); ATR-ratio is tanh-scaled bar momentum.
+//  ≥2 of 3 indicators must agree to fire — prevents single-indicator whipsaws.
+//+------------------------------------------------------------------+
+
+bool MomentumExitSignal(double pos_dir) {
+    if(pos_dir == 0) return false;
+    if(g_rsi_handle == INVALID_HANDLE || g_bb_handle == INVALID_HANDLE || g_matr_handle == INVALID_HANDLE)
+        return false;
+
+    double rsi_buf[1], bb_upper[1], bb_lower[1], close_buf[2], atr_buf[1];
+    if(CopyBuffer(g_rsi_handle,  0, 0, 1, rsi_buf)   < 1) return false;
+    if(CopyBuffer(g_bb_handle,   1, 0, 1, bb_upper)  < 1) return false;  // upper band
+    if(CopyBuffer(g_bb_handle,   2, 0, 1, bb_lower)  < 1) return false;  // lower band
+    if(CopyClose(Symbol(), PERIOD_M1, 0, 2, close_buf) < 2) return false;
+    if(CopyBuffer(g_matr_handle, 0, 0, 1, atr_buf)   < 1) return false;
+
+    double rsi     = rsi_buf[0] / 100.0;
+    double bb_rng  = bb_upper[0] - bb_lower[0];
+    double bb_pctb = (bb_rng > 1e-8) ? (close_buf[0] - bb_lower[0]) / bb_rng : 0.5;
+    double atr_r   = (atr_buf[0] > 1e-8) ? MathTanh((close_buf[0] - close_buf[1]) / atr_buf[0]) : 0.0;
+
+    int votes = 0;
+    if(pos_dir > 0) {
+        if(rsi     < 0.35)  votes++;
+        if(bb_pctb < 0.20)  votes++;
+        if(atr_r   < -0.10) votes++;
+    } else {
+        if(rsi     > 0.65) votes++;
+        if(bb_pctb > 0.80) votes++;
+        if(atr_r   > 0.10) votes++;
+    }
+    return (votes >= 2);
 }
 
 //+------------------------------------------------------------------+

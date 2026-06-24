@@ -3,11 +3,11 @@
 pub struct Indicators {
     pub atr:        f32,
     pub atr_ratio:  f32,   // tanh((close[-1] - close[-2]) / ATR)
-    pub vwap_dev:   f32,   // tanh((close - vwap) / ATR)
+    pub vwap_dev:   f32,   // tanh((close - true_vwap) / ATR)
     pub rsi_63:     f32,   // [0,1]
     pub bb_pctb:    f32,   // [0,1]
     pub vol_zscore: f32,   // tanh(rolling z-score)
-    pub hurst:      f32,   // DFA [0,1]
+    pub hurst:      f32,   // DFA [0,1] — 240-bar window
 }
 
 impl Indicators {
@@ -24,12 +24,12 @@ impl Indicators {
         let atr_r   = if n >= 2 {
             ((close[n-1] - close[n-2]) / atr.max(1e-8)).tanh()
         } else { 0.0 };
-        let vwap    = session_vwap(close, session);
+        let vwap    = session_vwap(close, volume, session);
         let vwap_d  = ((close[n-1] - vwap) / atr.max(1e-8)).tanh();
         let rsi     = rsi(close, 63);
         let bbp     = bb_pctb(close, 20);
         let volz    = vol_zscore(volume, 120);
-        let h       = hurst_dfa(close, 120);
+        let h       = hurst_dfa(close, 240);
         Self {
             atr,
             atr_ratio:  atr_r,
@@ -65,18 +65,19 @@ fn wilder_atr(close: &[f32], high: &[f32], low: &[f32], period: usize) -> f32 {
     atr
 }
 
-fn session_vwap(close: &[f32], session: &[f32]) -> f32 {
+/// True VWAP: price * tick_volume weighted, resets at session boundary.
+fn session_vwap(close: &[f32], volume: &[f32], session: &[f32]) -> f32 {
     let mut cum_pv = 0f32;
     let mut cum_v  = 0f32;
     let mut prev_s = -1i32;
-    for (i, (&c, &s)) in close.iter().zip(session.iter()).enumerate() {
+    for ((&c, &v), &s) in close.iter().zip(volume.iter()).zip(session.iter()) {
         let bucket = (s * 3.0) as i32;
         if bucket != prev_s {
             cum_pv = 0.0; cum_v = 0.0; prev_s = bucket;
         }
-        cum_pv += c * 1.0;
-        cum_v  += 1.0;
-        let _ = i;
+        let vol = v.max(1.0);   // guard against zero-volume gaps
+        cum_pv += c * vol;
+        cum_v  += vol;
     }
     if cum_v > 0.0 { cum_pv / cum_v } else { *close.last().unwrap_or(&0.0) }
 }
@@ -142,7 +143,7 @@ fn dfa_hurst(x: &[f32]) -> f32 {
     let y: Vec<f32> = x.iter().scan(0f32, |acc, &v| {
         *acc += v - mean; Some(*acc)
     }).collect();
-    let scales: &[usize] = &[4, 6, 8, 10, 14, 18];
+    let scales: &[usize] = &[4, 6, 8, 12, 16, 24, 32];
     let mut log_s = Vec::new();
     let mut log_f = Vec::new();
     for &s in scales {

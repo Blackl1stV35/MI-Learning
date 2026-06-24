@@ -6,6 +6,7 @@ rust_signal_server/target/
 
 *.csv
 *.set
+*.bin
 
 __pycache__/
 logs/

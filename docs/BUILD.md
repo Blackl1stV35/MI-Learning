@@ -61,17 +61,33 @@ Common\Files = %APPDATA%\MetaQuotes\Terminal\Common\Files\
 ```powershell
 $common = "$env:APPDATA\MetaQuotes\Terminal\Common\Files"
 
+# Serial (default — recommended for small datasets < 500K bars)
 .\rust_signal_server\target\release\signal_server.exe replay `
     --bars    "$common\XAUUSD_M1_bars.csv" `
     --out     "$common\signals.csv" `
     --obs-out "$common\signals_obs.bin" `
     --actor   "models\actor_weights.json"
+
+# Parallel (--parallel flag — ~8x faster, ideal for 2.5M+ bar datasets)
+.\rust_signal_server\target\release\signal_server.exe replay `
+    --bars    "bars_2020_2026.csv" `
+    --out     "signals_full.csv" `
+    --obs-out "signals_obs_full.bin" `
+    --actor   "models\actor_weights.json" `
+    --parallel
 ```
 
-Expected output:
+Expected output (serial):
 ```
 INFO  signal_server > Replay done -- 100001 bars in, 99762 rows out -> signals.csv
 INFO  signal_server > Obs binary written: 99762 rows x 118 cols -> signals_obs.bin
+```
+
+Expected output (parallel, 8 cores, 2.5M bars):
+```
+INFO  signal_server > Parsed 2500000 bars from bars_2020_2026.csv
+INFO  signal_server > Parallel replay: 2500000 bars, 611 chunks of 4096, 8 threads
+INFO  signal_server > Parallel replay done -- 2500000 bars in, 2499761 rows out -> signals_full.csv
 ```
 
 `signals_obs.bin` format: `[n_rows:u32LE][n_cols=118:u32LE][n_rows×118×f32LE]`
@@ -217,6 +233,52 @@ Dashboard panels:
 - **Override Log** — XAUUSD_Meta override events
 
 Auto-refreshes every 30 seconds.
+
+---
+
+## Backtest performance evaluation
+
+```powershell
+# Requires both bars CSV and signals CSV
+python evaluate_performance.py `
+    "$env:APPDATA\MetaQuotes\Terminal\Common\Files\XAUUSD_M1_bars.csv" `
+    "$env:APPDATA\MetaQuotes\Terminal\Common\Files\signals.csv"
+
+# Use final_dir (blended actor+rule) instead of pure rule signal
+python evaluate_performance.py --final-dir
+```
+
+Output: console P&L table + `logs/performance_metrics.json`
+
+Metrics computed: win rate, profit factor, Sharpe, max drawdown, avg P&L/trade,
+gross profit/loss, bull/bear regime breakdown, BUY/SELL direction split.
+
+---
+
+## Expand training data to post-COVID regime (2020–2026)
+
+```powershell
+# 1. Download ~2.5M M1 bars from Dukascopy (free, no API key required)
+#    First: validate price divisor is correct for your download region:
+python download_dukascopy.py --validate-price
+
+#    Full download (~45–90 min):
+python download_dukascopy.py --from 2020.01.01 --to 2026.06.23 --out bars_2020_2026.csv
+
+# 2. Run parallel replay on full dataset (~2–5 min on 8 cores)
+.\rust_signal_server\target\release\signal_server.exe replay `
+    --bars  bars_2020_2026.csv `
+    --out   signals_full.csv `
+    --obs-out signals_obs_full.bin `
+    --actor models\actor_weights.json `
+    --parallel
+
+# 3. Retrain with regime-diverse data
+python train_offline.py  # update paths to signals_full.csv / signals_obs_full.bin first
+
+# 4. Restart server
+.\start_live.ps1
+```
 
 ---
 

@@ -1,14 +1,15 @@
 //! XAUUSD signal server v0.3 — std::net::TcpListener (no ZMQ).
 //!
-//! Newline-delimited JSON over a persistent TCP connection.
-//! MT5 connects once; each bar sends one JSON line, receives one JSON line.
-//!
 //! Modes:
 //!   serve   (default)  ./signal_server [--bind 127.0.0.1:5555] [--actor models/actor_weights.json]
-//!   replay             ./signal_server replay --bars historical.csv --out signals.csv [--actor ...]
+//!   replay             ./signal_server replay --bars bars.csv --out signals.csv [--actor ...] [--parallel]
+//!
+//! Protocol: accepts raw newline-JSON (TCP) and HTTP POST (WebRequest) on the same port.
+//! Auto-detected by first line of each connection.
 
 use anyhow::Result;
 use log::{info, warn};
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -55,6 +56,7 @@ struct SignalResponse {
     actor_confidence: f32,
     final_dir:        f32,
     should_exit:      bool,
+    momentum_exit:    bool,
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -121,7 +123,7 @@ fn run_server(args: &[String]) -> Result<()> {
             continue 'accept;
         }
 
-        // Raw newline-delimited JSON (persistent connection, existing MT5 TCP protocol)
+        // Raw newline-delimited JSON (persistent connection)
         info!("MT5 connected from {} (raw JSON)", addr);
         let mut line = first_line;
         loop {
@@ -156,7 +158,7 @@ fn run_server(args: &[String]) -> Result<()> {
     }
 }
 
-// ── HTTP handler (for MT5 WebRequest fallback when raw socket is broker-blocked) ──
+// ── HTTP handler ──────────────────────────────────────────────────────────────
 fn serve_http<R: Read>(
     _request_line: &str,
     reader:        &mut BufReader<R>,
@@ -165,7 +167,6 @@ fn serve_http<R: Read>(
     tda:           &mut WassersteinTracker,
     actor:         &Option<DsacActor>,
 ) {
-    // Parse headers — we only need Content-Length
     let mut content_length = 0usize;
     loop {
         let mut hdr = String::new();
@@ -174,7 +175,7 @@ fn serve_http<R: Read>(
             _ => {}
         }
         let t = hdr.trim();
-        if t.is_empty() { break; } // blank line = end of headers
+        if t.is_empty() { break; }
         if t.len() > 15 && t[..15].eq_ignore_ascii_case("content-length:") {
             content_length = t[15..].trim().parse().unwrap_or(0);
         }
@@ -209,133 +210,7 @@ fn serve_http<R: Read>(
     let _ = writer.write_all(&resp_bytes);
 }
 
-// ── Offline replay ────────────────────────────────────────────────────────────
-//
-// Input CSV columns  : datetime,open,high,low,close,tick_volume
-// Output CSV columns : datetime,direction_bias,signal_strength,final_dir,
-//                      should_exit,hurst,tda_wasserstein,regime,actor_dir,
-//                      actor_confidence,sl_pips,tp_pips,lot_suggestion
-//
-// --obs-out <path>   : writes a binary file of 118D obs vectors, one per signal
-//                      row (same order). Format: [n_rows:u32LE][n_cols:u32LE]
-//                      then n_rows × n_cols × f32LE. Load in Python with
-//                      np.frombuffer(f.read(n*118*4), dtype='<f4').reshape(n,118)
-//
-// pos_dir / unrealized / hold_fraction are held at 0 (flat-position assumption).
-// TDA tracker is stateful and processes bars in sequence — do not shuffle input.
-fn run_replay(args: &[String]) -> Result<()> {
-    let bars_path = arg_value(args, "--bars")
-        .ok_or_else(|| anyhow::anyhow!("--bars <path> required for replay"))?;
-    let out_path  = arg_value(args, "--out")
-        .ok_or_else(|| anyhow::anyhow!("--out <path> required for replay"))?;
-    let obs_path  = arg_value(args, "--obs-out");
-
-    let actor   = load_actor(arg_value(args, "--actor"));
-    let scatter = ScatterBlock::new();
-    let mut tda = WassersteinTracker::new(60);
-
-    let content = std::fs::read_to_string(&bars_path)?;
-    let mut lines = content.lines();
-    let _header = lines.next(); // skip header
-
-    let mut window: Vec<[f32; 8]> = Vec::with_capacity(SEQ_LEN);
-    let mut out   = std::fs::File::create(&out_path)?;
-    let mut all_obs: Vec<Vec<f32>> = if obs_path.is_some() {
-        Vec::with_capacity(100_000)
-    } else {
-        Vec::new()
-    };
-
-    writeln!(out,
-        "datetime,direction_bias,signal_strength,final_dir,should_exit,\
-         hurst,tda_wasserstein,regime,actor_dir,actor_confidence,\
-         sl_pips,tp_pips,lot_suggestion")?;
-
-    let (mut bar_n, mut sig_n) = (0u64, 0u64);
-
-    for raw in lines {
-        // Columns: datetime,open,high,low,close,tick_volume[,...]
-        let f: Vec<&str> = raw.splitn(7, ',').collect();
-        if f.len() < 6 { continue; }
-
-        let datetime = f[0].trim();
-        let open  = f[1].trim().parse::<f32>().unwrap_or(0.0);
-        let high  = f[2].trim().parse::<f32>().unwrap_or(0.0);
-        let low   = f[3].trim().parse::<f32>().unwrap_or(0.0);
-        let close = f[4].trim().parse::<f32>().unwrap_or(0.0);
-        let vol   = f[5].trim().parse::<f32>().unwrap_or(0.0);
-        if close <= 0.0 { continue; }
-
-        // Derive session_phase from bar datetime; event_risk = 0.0 (no calendar)
-        let session_ph = session_phase_from_dt(datetime);
-        let bar: [f32; 8] = [open, high, low, close, vol, 0.0, session_ph, 0.0];
-
-        if window.len() == SEQ_LEN { window.remove(0); }
-        window.push(bar);
-        bar_n += 1;
-
-        if window.len() < SEQ_LEN { continue; }
-
-        let req_json = serde_json::json!({
-            "bars":          window,
-            "pos_dir":       0.0_f32,
-            "unrealized":    0.0_f32,
-            "hold_fraction": 0.0_f32
-        });
-        let req_bytes = serde_json::to_vec(&req_json)?;
-
-        match handle_request(&req_bytes, &scatter, &mut tda, &actor) {
-            Ok(r) => {
-                writeln!(out,
-                    "{},{:.4},{:.4},{:.4},{},{:.4},{:.4},{:.4},{:.4},{:.4},{:.2},{:.2},{:.3}",
-                    datetime,
-                    r.direction_bias, r.signal_strength, r.final_dir,
-                    r.should_exit as u8,
-                    r.hurst, r.tda_wasserstein, r.regime,
-                    r.actor_dir, r.actor_confidence,
-                    r.sl_pips, r.tp_pips, r.lot_suggestion,
-                )?;
-                if obs_path.is_some() {
-                    all_obs.push(r.obs);
-                }
-                sig_n += 1;
-            }
-            Err(e) => warn!("Replay bar {}: {}", datetime, e),
-        }
-    }
-
-    info!("Replay done -- {} bars in, {} rows out -> {}", bar_n, sig_n, out_path);
-
-    // Write obs binary: [n_rows:u32][n_cols:u32][n_rows * n_cols * f32]
-    if let Some(ref path) = obs_path {
-        let n = all_obs.len() as u32;
-        let mut f = std::fs::File::create(path)?;
-        f.write_all(&n.to_le_bytes())?;
-        f.write_all(&(OBS_DIM as u32).to_le_bytes())?;
-        for obs in &all_obs {
-            for &v in obs {
-                f.write_all(&v.to_le_bytes())?;
-            }
-        }
-        info!("Obs binary written: {} rows x {} cols -> {}", n, OBS_DIM, path);
-    }
-
-    Ok(())
-}
-
-/// Parse session phase from MT5 datetime string "2026.01.01 00:00" or "2026.01.01 00:00:00".
-fn session_phase_from_dt(dt: &str) -> f32 {
-    let hour: u32 = dt.splitn(2, ' ')
-        .nth(1)
-        .and_then(|t| t.splitn(2, ':').next())
-        .and_then(|h| h.parse().ok())
-        .unwrap_or(0);
-    if hour < 8  { 0.0 }
-    else if hour < 13 { 0.5 }
-    else { 1.0 }
-}
-
-// ── Core signal pipeline ──────────────────────────────────────────────────────
+// ── Core signal pipeline — JSON wrapper (live path) ───────────────────────────
 fn handle_request(
     raw:     &[u8],
     scatter: &ScatterBlock,
@@ -345,28 +220,41 @@ fn handle_request(
     let req: SignalRequest = serde_json::from_slice(raw)?;
     anyhow::ensure!(req.bars.len() == SEQ_LEN,
         "Expected {} bars, got {}", SEQ_LEN, req.bars.len());
+    process_bars(&req.bars, req.pos_dir, req.unrealized, req.hold_fraction,
+                 scatter, tda, actor)
+}
 
-    let close:   Vec<f32> = req.bars.iter().map(|b| b[3]).collect();
-    let high:    Vec<f32> = req.bars.iter().map(|b| b[1]).collect();
-    let low:     Vec<f32> = req.bars.iter().map(|b| b[2]).collect();
-    let volume:  Vec<f32> = req.bars.iter().map(|b| b[4]).collect();
-    let session: Vec<f32> = req.bars.iter().map(|b| b[6]).collect();
-    let event_risk = req.bars.last().map(|b| b[7]).unwrap_or(0.0);
+// ── Core signal pipeline — direct (replay path, no JSON overhead) ─────────────
+fn process_bars(
+    bars:      &[[f32; 8]],
+    pos_dir:   f32,
+    unrealized: f32,
+    hold_frac: f32,
+    scatter:   &ScatterBlock,
+    tda:       &mut WassersteinTracker,
+    actor:     &Option<DsacActor>,
+) -> Result<SignalResponse> {
+    let close:   Vec<f32> = bars.iter().map(|b| b[3]).collect();
+    let high:    Vec<f32> = bars.iter().map(|b| b[1]).collect();
+    let low:     Vec<f32> = bars.iter().map(|b| b[2]).collect();
+    let volume:  Vec<f32> = bars.iter().map(|b| b[4]).collect();
+    let session: Vec<f32> = bars.iter().map(|b| b[6]).collect();
+    let event_risk = bars.last().map(|b| b[7]).unwrap_or(0.0);
 
-    let scatter_feats = scatter.forward(&req.bars);
+    let scatter_feats = scatter.forward(bars);
     let ind = Indicators::compute(&close, &high, &low, &volume, &session, event_risk);
 
     let log_ret: Vec<f32> = close.windows(2)
         .map(|w| (w[1] / w[0].max(1e-8)).ln())
         .collect();
     let tda_w  = tda.update(&log_ret);
-    let regime = regime::bear_bull_proxy(&close, &volume);
+    let regime_v = regime::bear_bull_proxy(&close, &volume);
 
-    let (rule_dir, strength) = meta_policy_signal(&ind, tda_w, event_risk, regime);
+    let (rule_dir, strength) = meta_policy_signal(&ind, tda_w, event_risk, regime_v);
     let atr_last = ind.atr;
     let (sl_pips, tp_pips, lot) = size_trade(rule_dir, strength, atr_last, event_risk);
 
-    let unreal_norm = (req.unrealized / atr_last.max(1e-8)).tanh();
+    let unreal_norm = (unrealized / atr_last.max(1e-8)).tanh();
     let mut obs = Vec::with_capacity(OBS_DIM);
     obs.extend_from_slice(&scatter_feats);
     obs.push(ind.atr_ratio);
@@ -378,13 +266,15 @@ fn handle_request(
     obs.push(tda_w);
     obs.push(session.last().copied().unwrap_or(0.5));
     obs.push(event_risk);
-    obs.push(regime);
-    obs.push(req.pos_dir);
+    obs.push(regime_v);
+    obs.push(pos_dir);
     obs.push(unreal_norm);
-    obs.push(req.hold_fraction);
+    obs.push(hold_frac);
     obs.push(strength);
 
-    let (actor_dir, actor_exit, actor_confidence, final_dir, should_exit) =
+    let mom_exit = momentum_exit_rule(pos_dir, &ind);
+
+    let (actor_dir, actor_exit, actor_confidence, final_dir, actor_should_exit) =
         match actor {
             Some(a) => match a.forward(&obs) {
                 Ok((ad, ae)) => {
@@ -396,6 +286,8 @@ fn handle_request(
             None => (0.0, 0.0, strength, rule_dir, false),
         };
 
+    let should_exit = actor_should_exit || mom_exit;
+
     Ok(SignalResponse {
         obs,
         direction_bias:  rule_dir,
@@ -405,13 +297,219 @@ fn handle_request(
         hurst:           ind.hurst,
         tda_wasserstein: tda_w,
         event_risk,
-        regime,
+        regime:          regime_v,
         actor_dir,
         actor_exit,
         actor_confidence,
         final_dir,
         should_exit,
+        momentum_exit:   mom_exit,
     })
+}
+
+// ── Offline replay ────────────────────────────────────────────────────────────
+//
+// Input CSV columns  : datetime,open,high,low,close,tick_volume
+// Output CSV columns : datetime,direction_bias,signal_strength,final_dir,
+//                      should_exit,hurst,tda_wasserstein,regime,actor_dir,
+//                      actor_confidence,sl_pips,tp_pips,lot_suggestion
+//
+// --obs-out <path>   : writes flat binary of 118D obs vectors
+//                      format: [n_rows:u32LE][n_cols:u32LE][n_rows × n_cols × f32LE]
+//                      load in Python: np.frombuffer(...).reshape(n, 118)
+//
+// --parallel         : process in Rayon thread pool (ideal for 2.5M+ bar datasets).
+//                      TDA is warmed up with 120-bar lead-in per chunk — output is
+//                      equivalent to serial for all but the very first chunk.
+fn run_replay(args: &[String]) -> Result<()> {
+    let bars_path = arg_value(args, "--bars")
+        .ok_or_else(|| anyhow::anyhow!("--bars <path> required for replay"))?;
+    let out_path  = arg_value(args, "--out")
+        .ok_or_else(|| anyhow::anyhow!("--out <path> required for replay"))?;
+    let obs_path  = arg_value(args, "--obs-out");
+    let parallel  = args.iter().any(|a| a == "--parallel");
+
+    let actor   = load_actor(arg_value(args, "--actor"));
+    let scatter = ScatterBlock::new();
+
+    // ── Parse all bars upfront ────────────────────────────────────────────────
+    let content = std::fs::read_to_string(&bars_path)?;
+    let mut lines = content.lines();
+    let _header = lines.next();
+
+    let mut all_times: Vec<String>   = Vec::new();
+    let mut all_bars:  Vec<[f32; 8]> = Vec::new();
+
+    for raw in lines {
+        let f: Vec<&str> = raw.splitn(7, ',').collect();
+        if f.len() < 6 { continue; }
+        let datetime = f[0].trim().to_string();
+        let open  = f[1].trim().parse::<f32>().unwrap_or(0.0);
+        let high  = f[2].trim().parse::<f32>().unwrap_or(0.0);
+        let low   = f[3].trim().parse::<f32>().unwrap_or(0.0);
+        let close = f[4].trim().parse::<f32>().unwrap_or(0.0);
+        let vol   = f[5].trim().parse::<f32>().unwrap_or(0.0);
+        if close <= 0.0 { continue; }
+        let session_ph = session_phase_from_dt(&datetime);
+        all_times.push(datetime);
+        all_bars.push([open, high, low, close, vol, 0.0, session_ph, 0.0]);
+    }
+
+    let n = all_bars.len();
+    info!("Parsed {} bars from {}", n, bars_path);
+
+    // ── Dispatch to serial or parallel ────────────────────────────────────────
+    if parallel {
+        return run_replay_parallel(&all_times, &all_bars, &out_path, obs_path, &scatter, &actor);
+    }
+
+    // ── Serial replay — zero JSON serialisation overhead ─────────────────────
+    let mut tda = WassersteinTracker::new(60);
+    let mut out = std::fs::File::create(&out_path)?;
+    let mut all_obs: Vec<Vec<f32>> = if obs_path.is_some() { Vec::with_capacity(n) } else { Vec::new() };
+
+    writeln!(out,
+        "datetime,direction_bias,signal_strength,final_dir,should_exit,\
+         hurst,tda_wasserstein,regime,actor_dir,actor_confidence,\
+         sl_pips,tp_pips,lot_suggestion")?;
+
+    let first_sig = SEQ_LEN - 1;
+    let mut sig_n = 0u64;
+
+    for i in first_sig..n {
+        let window = &all_bars[i + 1 - SEQ_LEN..=i];
+        let dt = &all_times[i];
+
+        match process_bars(window, 0.0, 0.0, 0.0, &scatter, &mut tda, &actor) {
+            Ok(r) => {
+                writeln!(out,
+                    "{},{:.4},{:.4},{:.4},{},{:.4},{:.4},{:.4},{:.4},{:.4},{:.2},{:.2},{:.3}",
+                    dt,
+                    r.direction_bias, r.signal_strength, r.final_dir,
+                    r.should_exit as u8,
+                    r.hurst, r.tda_wasserstein, r.regime,
+                    r.actor_dir, r.actor_confidence,
+                    r.sl_pips, r.tp_pips, r.lot_suggestion,
+                )?;
+                if obs_path.is_some() { all_obs.push(r.obs); }
+                sig_n += 1;
+            }
+            Err(e) => warn!("Replay bar {}: {}", dt, e),
+        }
+    }
+
+    info!("Replay done -- {} bars in, {} rows out -> {}", n, sig_n, out_path);
+    write_obs_binary(obs_path, &all_obs)
+}
+
+// ── Parallel replay via Rayon ─────────────────────────────────────────────────
+//
+// Each chunk of CHUNK_SIZE signal bars is processed independently.
+// LEAD_IN warm-up calls before each chunk stabilise the TDA Wasserstein tracker.
+// Since TDA only looks at the last 60 log-returns (within the 240-bar window),
+// 60 warm-up calls are sufficient for exact convergence; we use 120 for safety.
+// Rayon's par_iter preserves chunk order, so no sort step is needed.
+fn run_replay_parallel(
+    all_times: &[String],
+    all_bars:  &[[f32; 8]],
+    out_path:  &str,
+    obs_path:  Option<String>,
+    scatter:   &ScatterBlock,
+    actor:     &Option<DsacActor>,
+) -> Result<()> {
+    let n = all_bars.len();
+    let first_sig = SEQ_LEN - 1;
+
+    const CHUNK_SIZE: usize = 4096;
+    const LEAD_IN:    usize = 120;
+
+    let chunks: Vec<(usize, usize)> = (first_sig..n)
+        .step_by(CHUNK_SIZE)
+        .map(|s| (s, (s + CHUNK_SIZE).min(n)))
+        .collect();
+
+    let n_threads = rayon::current_num_threads();
+    info!("Parallel replay: {} bars, {} chunks of {}, {} threads",
+          n, chunks.len(), CHUNK_SIZE, n_threads);
+
+    // Process each chunk independently; Rayon preserves ordering in collect()
+    let chunk_results: Vec<Vec<(usize, SignalResponse)>> = chunks
+        .par_iter()
+        .map(|&(sig_start, sig_end)| {
+            // Extend backward for TDA warm-up; clamped to first valid signal index
+            let warmup_start = sig_start.saturating_sub(LEAD_IN).max(first_sig);
+            let mut tda = WassersteinTracker::new(60);
+            let mut out = Vec::with_capacity(sig_end - sig_start);
+
+            for i in warmup_start..sig_end {
+                let window = &all_bars[i + 1 - SEQ_LEN..=i];
+                match process_bars(window, 0.0, 0.0, 0.0, scatter, &mut tda, actor) {
+                    Ok(r) if i >= sig_start => out.push((i, r)),
+                    _ => {}
+                }
+            }
+            out
+        })
+        .collect();
+
+    // Write results in chunk order (order is preserved by Rayon)
+    let mut out_file = std::fs::File::create(out_path)?;
+    writeln!(out_file,
+        "datetime,direction_bias,signal_strength,final_dir,should_exit,\
+         hurst,tda_wasserstein,regime,actor_dir,actor_confidence,\
+         sl_pips,tp_pips,lot_suggestion")?;
+
+    let store_obs = obs_path.is_some();
+    let mut all_obs: Vec<Vec<f32>> = if store_obs { Vec::with_capacity(n) } else { Vec::new() };
+    let mut sig_n = 0u64;
+
+    for chunk in &chunk_results {
+        for (i, r) in chunk {
+            writeln!(out_file,
+                "{},{:.4},{:.4},{:.4},{},{:.4},{:.4},{:.4},{:.4},{:.4},{:.2},{:.2},{:.3}",
+                all_times[*i],
+                r.direction_bias, r.signal_strength, r.final_dir,
+                r.should_exit as u8,
+                r.hurst, r.tda_wasserstein, r.regime,
+                r.actor_dir, r.actor_confidence,
+                r.sl_pips, r.tp_pips, r.lot_suggestion,
+            )?;
+            if store_obs { all_obs.push(r.obs.clone()); }
+            sig_n += 1;
+        }
+    }
+
+    info!("Parallel replay done -- {} bars in, {} rows out -> {}", n, sig_n, out_path);
+    write_obs_binary(obs_path, &all_obs)
+}
+
+// ── Obs binary writer ─────────────────────────────────────────────────────────
+fn write_obs_binary(obs_path: Option<String>, all_obs: &[Vec<f32>]) -> Result<()> {
+    if let Some(ref path) = obs_path {
+        let n = all_obs.len() as u32;
+        let mut f = std::fs::File::create(path)?;
+        f.write_all(&n.to_le_bytes())?;
+        f.write_all(&(OBS_DIM as u32).to_le_bytes())?;
+        for obs in all_obs {
+            for &v in obs {
+                f.write_all(&v.to_le_bytes())?;
+            }
+        }
+        info!("Obs binary written: {} rows x {} cols -> {}", n, OBS_DIM, path);
+    }
+    Ok(())
+}
+
+/// Parse session phase from MT5 datetime string "2026.01.01 00:00" or ISO "2026-01-01 00:00:00".
+fn session_phase_from_dt(dt: &str) -> f32 {
+    let hour: u32 = dt.splitn(2, ' ')
+        .nth(1)
+        .and_then(|t| t.splitn(2, ':').next())
+        .and_then(|h| h.parse().ok())
+        .unwrap_or(0);
+    if hour < 8  { 0.0 }
+    else if hour < 13 { 0.5 }
+    else { 1.0 }
 }
 
 // ── Rule-based meta-policy ────────────────────────────────────────────────────
@@ -443,14 +541,49 @@ fn meta_policy_signal(
     ];
     let n_sell: f32 = sell_votes.iter().map(|&v| v as u8 as f32).sum();
     let n_buy:  f32 = buy_votes.iter().map(|&v| v as u8 as f32).sum();
-    let thresh  = if ind.hurst > 0.50 { 3.0 } else { 4.0 };
 
-    if n_sell >= thresh && n_sell > n_buy {
+    // Direction-aware thresholds: with-trend trades are easier to trigger,
+    // counter-trend trades require near-consensus.  Bull/bear asymmetry
+    // directly targets the observed -38K bull-regime P&L vs +130K bear-regime.
+    let base       = if ind.hurst > 0.50 { 3.0f32 } else { 4.0f32 };
+    let buy_thresh  = if bull  { base } else { base + 1.0 };
+    let sell_thresh = if !bull { base } else { base + 1.0 };
+
+    if n_sell >= sell_thresh && n_sell > n_buy {
         (-1.0, n_sell / 5.0)
-    } else if n_buy >= thresh && n_buy > n_sell {
+    } else if n_buy >= buy_thresh && n_buy > n_sell {
         (1.0, n_buy / 5.0)
     } else {
         (0.0, 0.0)
+    }
+}
+
+// Momentum reversal exit: fires when ≥2 of 4 validated indicators confirm the
+// position has turned against us.  Requires pos_dir ≠ 0 (live server only;
+// replay always passes pos_dir=0 so this is always false there).
+//
+// Thresholds are grounded: RSI 35/65 = Wilder oversold/overbought boundaries;
+// BB%B 0.20/0.80 = ±2σ breakout zone; VWAP-dev ±0.15 ≈ tanh(0.15×ATR) deviation;
+// ATR-ratio ±0.10 = tanh-scaled single-bar momentum sign.
+// 2/4 majority prevents whipsaws from a single noisy indicator.
+fn momentum_exit_rule(pos_dir: f32, ind: &Indicators) -> bool {
+    if pos_dir == 0.0 { return false; }
+    if pos_dir > 0.0 {
+        let votes: usize = [
+            ind.rsi_63    < 0.35,
+            ind.vwap_dev  < -0.15,
+            ind.bb_pctb   < 0.20,
+            ind.atr_ratio < -0.10,
+        ].iter().filter(|&&v| v).count();
+        votes >= 2
+    } else {
+        let votes: usize = [
+            ind.rsi_63    > 0.65,
+            ind.vwap_dev  > 0.15,
+            ind.bb_pctb   > 0.80,
+            ind.atr_ratio > 0.10,
+        ].iter().filter(|&&v| v).count();
+        votes >= 2
     }
 }
 

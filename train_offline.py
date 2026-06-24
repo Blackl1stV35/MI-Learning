@@ -319,6 +319,10 @@ def main():
     p.add_argument('--steps',    type=int, default=20_000)
     p.add_argument('--batch',    type=int, default=256)
     p.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu')
+    p.add_argument('--subsample', type=int, default=0,
+                   help='randomly subsample N rows for training buffer '
+                        '(0=use all; recommended 500000 for 2.5M row datasets '
+                        'to fit in ~8 GB RAM). obs_mean/std computed on FULL dataset.')
     args = p.parse_args()
 
     print("\n=== Offline DSAC Fine-Tuning ===")
@@ -339,12 +343,27 @@ def main():
     print(f"  {len(bar_list):,} bars")
 
     print(f"\n[4/5] Building experience buffer...")
+    # Compute obs stats on full dataset (important for correct normalisation
+    # across all regimes even when subsampling the training buffer).
     obs_mean, obs_std = compute_obs_stats(obs_mat)
     obs_norm = apply_obs_norm(obs_mat, obs_mean, obs_std)
     print(f"  Obs norm: scatter mean={obs_mean[:104].mean():.1f}->{0:.1f}  "
           f"std range [{obs_std.min():.3f}, {obs_std.max():.3f}]")
+
+    # Subsample for memory efficiency on large datasets (2.5M rows = ~7 GB tensors).
+    if args.subsample > 0 and obs_norm.shape[0] > args.subsample:
+        rng = np.random.default_rng(42)
+        idx = rng.choice(obs_norm.shape[0] - 1, size=args.subsample, replace=False)
+        idx.sort()
+        obs_sub  = obs_norm[idx]
+        sigs_sub = [sigs[i] for i in idx]
+        print(f"  Subsampled {args.subsample:,} / {obs_norm.shape[0]:,} rows for buffer")
+    else:
+        obs_sub  = obs_norm
+        sigs_sub = sigs
+
     obs_b, act_b, rew_b, nobs_b, done_b = build_buffer(
-        obs_norm, sigs, bar_list, bar_idx)
+        obs_sub, sigs_sub, bar_list, bar_idx)
 
     obs_t  = torch.FloatTensor(obs_b)
     act_t  = torch.FloatTensor(act_b)
