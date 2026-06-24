@@ -1,0 +1,379 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>XAUUSD Signal Backtest</title>
+<script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
+<style>
+:root{--bg:#0d1117;--surf:#161b22;--brd:#30363d;--txt:#c9d1d9;--dim:#8b949e;
+      --grn:#3fb950;--red:#f85149;--blu:#58a6ff;--ylw:#d29922;--pur:#bc8cff}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--txt);font:12px/1.4 'Segoe UI',sans-serif;
+     display:flex;flex-direction:column;height:100vh;overflow:hidden}
+
+#toolbar{display:flex;align-items:center;gap:10px;padding:6px 12px;
+         background:var(--surf);border-bottom:1px solid var(--brd);flex-wrap:wrap}
+#toolbar h1{font-size:13px;color:var(--blu);white-space:nowrap;margin-right:4px}
+.grp{display:flex;align-items:center;gap:5px;border-left:1px solid var(--brd);padding-left:10px}
+.grp:first-of-type{border:none;padding-left:0}
+label{color:var(--dim);font-size:11px}
+input[type=text]{background:var(--bg);border:1px solid var(--brd);color:var(--txt);
+                  padding:3px 6px;border-radius:4px;font-size:11px;width:120px}
+select{background:var(--bg);border:1px solid var(--brd);color:var(--txt);
+       padding:3px 5px;border-radius:4px;font-size:11px}
+input[type=range]{width:70px;accent-color:var(--blu);vertical-align:middle}
+button{background:var(--bg);border:1px solid var(--brd);color:var(--txt);
+       padding:3px 8px;border-radius:4px;cursor:pointer;font-size:11px}
+button:hover{background:var(--brd)}
+button.on{border-color:var(--blu);color:var(--blu)}
+.sv{color:var(--dim);font-size:10px;min-width:28px}
+
+#statsbar{display:flex;gap:16px;padding:3px 12px;font-size:11px;
+          background:var(--bg);border-bottom:1px solid var(--brd);
+          color:var(--dim);flex-wrap:wrap}
+.si b{color:var(--txt)} .si.buy b{color:var(--grn)} .si.sell b{color:var(--red)}
+.si.pnl-pos b{color:var(--grn)} .si.pnl-neg b{color:var(--red)}
+
+#body{display:flex;flex:1;min-height:0}
+#charts{flex:1;display:flex;flex-direction:column;min-height:0;min-width:0}
+#main-chart{flex:3;min-height:0}
+#sub-row{flex:1;min-height:0;display:flex}
+#str-chart,#hurst-chart,#tda-chart{flex:1;min-height:0;min-width:0}
+
+#side{width:190px;background:var(--surf);border-left:1px solid var(--brd);
+      padding:10px;overflow-y:auto;font-size:11px;flex-shrink:0}
+#side h3{color:var(--blu);font-size:11px;margin-bottom:6px;margin-top:10px}
+#side h3:first-child{margin-top:0}
+.row{display:flex;justify-content:space-between;padding:1px 0;color:var(--dim)}
+.row .v{color:var(--txt)} .row .v.g{color:var(--grn)} .row .v.r{color:var(--red)}
+#bar-info{color:var(--dim);line-height:1.6}
+</style>
+</head>
+<body>
+
+<div id="toolbar">
+  <h1>XAUUSD M1 Backtest</h1>
+
+  <div class="grp">
+    <label>From</label>
+    <input type="text" id="from_dt" value="2026.06.01 00:00">
+    <label>To</label>
+    <input type="text" id="to_dt" value="2026.06.23 23:59">
+    <button onclick="loadData()">Load</button>
+  </div>
+
+  <div class="grp">
+    <button onclick="preset(1)">1D</button>
+    <button onclick="preset(7)">1W</button>
+    <button onclick="preset(30)">1M</button>
+    <button onclick="presetAll()">All</button>
+  </div>
+
+  <div class="grp">
+    <label>Source</label>
+    <select id="src" onchange="redraw()">
+      <option value="dir">Rule (direction_bias)</option>
+      <option value="fd">Blended (final_dir)</option>
+    </select>
+  </div>
+
+  <div class="grp">
+    <label>Min str</label>
+    <input type="range" id="s_str" min="0" max="1" step="0.05" value="0"
+           oninput="document.getElementById('sv_str').textContent=this.value;redraw()">
+    <span class="sv" id="sv_str">0.0</span>
+  </div>
+
+  <div class="grp">
+    <label>Min H</label>
+    <input type="range" id="s_h" min="0.4" max="0.75" step="0.01" value="0.5"
+           oninput="document.getElementById('sv_h').textContent=this.value;redraw()">
+    <span class="sv" id="sv_h">0.50</span>
+  </div>
+
+  <div class="grp">
+    <label>Trades</label>
+    <select id="trade_view" onchange="redraw()">
+      <option value="all">All</option>
+      <option value="tp">TP only</option>
+      <option value="sl">SL only</option>
+      <option value="off">Hide</option>
+    </select>
+  </div>
+</div>
+
+<div id="statsbar">
+  <span class="si">Bars <b id="st_bars">-</b></span>
+  <span class="si buy">BUY <b id="st_buy">-</b></span>
+  <span class="si sell">SELL <b id="st_sell">-</b></span>
+  <span class="si">HOLD <b id="st_hold">-</b></span>
+  <span class="si">Trades <b id="st_tr">-</b></span>
+  <span class="si" id="st_pnl_el">Net P&L <b id="st_pnl">-</b> USD/oz</span>
+  <span class="si">TP% <b id="st_tpw">-</b></span>
+  <span class="si">Avg H <b id="st_h">-</b></span>
+  <span class="si">TDA gate <b id="st_tda">-</b></span>
+</div>
+
+<div id="body">
+  <div id="charts">
+    <div id="main-chart"></div>
+    <div id="sub-row">
+      <div id="str-chart"></div>
+      <div id="hurst-chart"></div>
+      <div id="tda-chart"></div>
+    </div>
+  </div>
+  <div id="side">
+    <h3>Selected bar</h3>
+    <div id="bar-info" style="color:var(--dim);font-size:10px">Hover over chart</div>
+    <h3>Visible range</h3>
+    <div id="rng-stats"></div>
+  </div>
+</div>
+
+<script>
+// ── State ─────────────────────────────────────────────────────────────────────
+let BARS=[], SIGS=[], TRADES=[], META={};
+let busy=false;
+
+// ── Fetch ─────────────────────────────────────────────────────────────────────
+async function loadData(){
+  const from=document.getElementById('from_dt').value;
+  const to  =document.getElementById('to_dt').value;
+  const q=s=>`from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`;
+  const [b,s,t,m]=await Promise.all([
+    fetch('/api/bars?'+q()).then(r=>r.json()),
+    fetch('/api/signals?'+q()).then(r=>r.json()),
+    fetch('/api/trades?'+q()).then(r=>r.json()),
+    fetch('/api/meta').then(r=>r.json()),
+  ]);
+  BARS=b; SIGS=s; TRADES=t; META=m;
+  redraw();
+}
+
+// ── Date helpers ──────────────────────────────────────────────────────────────
+function parseDT(s){
+  // "2026.06.01 00:00"
+  const [d,t]=s.split(' ');const[y,mo,dy]=d.split('.');const[h,mi]=(t||'00:00').split(':');
+  return new Date(Date.UTC(+y,+mo-1,+dy,+h,+mi));
+}
+function fmtDT(d){
+  const p=n=>String(n).padStart(2,'0');
+  return `${d.getUTCFullYear()}.${p(d.getUTCMonth()+1)}.${p(d.getUTCDate())} ${p(d.getUTCHours())}:${p(d.getUTCMinutes())}`;
+}
+function preset(days){
+  const last=SIGS.length?SIGS[SIGS.length-1].t:META.last||'2026.06.23 23:59';
+  const ld=parseDT(last);
+  document.getElementById('from_dt').value=fmtDT(new Date(ld-days*86400000));
+  document.getElementById('to_dt').value=last;
+  loadData();
+}
+function presetAll(){
+  document.getElementById('from_dt').value=META.first||'2026.03.11 00:00';
+  document.getElementById('to_dt').value=META.last||'2026.06.23 23:59';
+  loadData();
+}
+
+// ── Filter & compute ──────────────────────────────────────────────────────────
+function filtered(){
+  const src=document.getElementById('src').value;
+  const minStr=parseFloat(document.getElementById('s_str').value);
+  const minH  =parseFloat(document.getElementById('s_h').value);
+  return SIGS.map(s=>{
+    const dir=src==='dir'?s.dir:s.fd;
+    const show=Math.abs(dir)>0.25 && s.str>=minStr && s.h>=minH;
+    return {...s,_dir:dir,_show:show};
+  });
+}
+
+function avg(arr){return arr.length?arr.reduce((a,b)=>a+b,0)/arr.length:0;}
+
+function updateStats(sigs,trades){
+  const show=sigs.filter(s=>s._show);
+  const buy=show.filter(s=>s._dir>0.25).length;
+  const sell=show.filter(s=>s._dir<-0.25).length;
+  const hold=sigs.length-buy-sell;
+  const tp=trades.filter(t=>t.outcome==='tp').length;
+  const pnl=trades.reduce((a,t)=>a+t.pnl_px,0);
+  const pct=trades.length?Math.round(100*tp/trades.length):0;
+
+  document.getElementById('st_bars').textContent=BARS.length.toLocaleString();
+  document.getElementById('st_buy').textContent=buy;
+  document.getElementById('st_sell').textContent=sell;
+  document.getElementById('st_hold').textContent=hold;
+  document.getElementById('st_tr').textContent=trades.length;
+  document.getElementById('st_pnl').textContent=(pnl>=0?'+':'')+pnl.toFixed(1);
+  document.getElementById('st_pnl_el').className='si '+(pnl>=0?'pnl-pos':'pnl-neg');
+  document.getElementById('st_tpw').textContent=pct+'%';
+  document.getElementById('st_h').textContent=avg(sigs.map(s=>s.h)).toFixed(3);
+  document.getElementById('st_tda').textContent=sigs.filter(s=>s.tda>0.35).length;
+
+  document.getElementById('rng-stats').innerHTML=[
+    ['BUY signals',buy,'g'],['SELL signals',sell,'r'],
+    ['Trades total',trades.length,''],['TP',tp,'g'],['SL',trades.filter(t=>t.outcome==='sl').length,'r'],
+    ['Timeout',trades.filter(t=>t.outcome==='timeout').length,''],
+    ['Net P&L (USD/oz)',(pnl>=0?'+':'')+pnl.toFixed(1),pnl>=0?'g':'r'],
+    ['TP win rate',pct+'%',pct>50?'g':'r'],
+    ['Bull bars',sigs.filter(s=>s.reg>0.5).length,''],
+    ['TDA gate fired',sigs.filter(s=>s.tda>0.35).length,''],
+  ].map(([k,v,cls])=>`<div class="row"><span>${k}</span><span class="v ${cls}">${v}</span></div>`).join('');
+}
+
+// ── Chart rendering ───────────────────────────────────────────────────────────
+const BASE={
+  paper_bgcolor:'#0d1117',plot_bgcolor:'#0d1117',
+  margin:{l:55,r:8,t:6,b:28},
+  font:{color:'#8b949e',size:10},
+  xaxis:{gridcolor:'#21262d',zerolinecolor:'#21262d',type:'date'},
+  yaxis:{gridcolor:'#21262d',zerolinecolor:'#21262d'},
+  hovermode:'x unified',hoverdistance:20,
+};
+const CFG={displayModeBar:false,responsive:true,scrollZoom:true};
+
+function mt5ToISO(s){
+  // "2026.06.01 00:00" -> "2026-06-01 00:00"
+  return s.replace(/^(\d{4})\.(\d{2})\.(\d{2})/,'$1-$2-$3');
+}
+
+function redraw(){
+  if(busy)return; busy=true;
+  requestAnimationFrame(()=>{ _draw(); busy=false; });
+}
+
+function _draw(){
+  const sigs=filtered();
+  const tvMode=document.getElementById('trade_view').value;
+  const trShow=TRADES.filter(t=>tvMode==='all'||(tvMode==='tp'&&t.outcome==='tp')||(tvMode==='sl'&&t.outcome==='sl'));
+
+  updateStats(sigs,TRADES);
+
+  const bx=BARS.map(b=>mt5ToISO(b.t));
+  const sx=sigs.map(s=>mt5ToISO(s.t));
+  const buySigs =sigs.filter(s=>s._show&&s._dir>0.25&&s.c!=null);
+  const sellSigs=sigs.filter(s=>s._show&&s._dir<-0.25&&s.c!=null);
+
+  // ── Main chart ──────────────────────────────────────────────────────────────
+  const useCandle=BARS.length<=3000;
+  const priceTrace = useCandle ? {
+    type:'candlestick',
+    x:bx, open:BARS.map(b=>b.o), high:BARS.map(b=>b.h),
+    low:BARS.map(b=>b.l), close:BARS.map(b=>b.c),
+    increasing:{line:{color:'#3fb950',width:1}}, decreasing:{line:{color:'#f85149',width:1}},
+    name:'Price',showlegend:false,hoverinfo:'x+y',
+  } : {
+    type:'scattergl',mode:'lines',x:bx,y:BARS.map(b=>b.c),
+    line:{color:'#58a6ff',width:1},name:'Close',showlegend:false,
+  };
+
+  // Trade P&L lines
+  const trTraces=[];
+  if(tvMode!=='off'){
+    for(const t of trShow){
+      const col=t.outcome==='tp'?'rgba(63,185,80,0.6)':'rgba(248,81,73,0.6)';
+      trTraces.push({
+        type:'scatter',mode:'lines',
+        x:[mt5ToISO(t.entry_t),mt5ToISO(t.exit_t)],
+        y:[t.entry_px,t.exit_px],
+        line:{color:col,width:1.5},showlegend:false,hoverinfo:'skip',
+      });
+    }
+  }
+
+  const buyMk={
+    type:'scattergl',mode:'markers',
+    x:buySigs.map(s=>mt5ToISO(s.t)),y:buySigs.map(s=>s.c-1.5),
+    marker:{symbol:'triangle-up',size:9,color:'#3fb950',opacity:0.9,
+            line:{color:'#0d1117',width:0.5}},
+    name:'BUY',
+    customdata:buySigs.map(s=>[s.str,s.h,s.sl,s.tp,s.lot]),
+    hovertemplate:'<b>BUY</b> %{x}<br>Str:%{customdata[0]:.2f} H:%{customdata[1]:.3f}<br>SL:%{customdata[2]:.1f} TP:%{customdata[3]:.1f} Lot:%{customdata[4]:.3f}<extra></extra>',
+  };
+  const sellMk={
+    type:'scattergl',mode:'markers',
+    x:sellSigs.map(s=>mt5ToISO(s.t)),y:sellSigs.map(s=>s.c+1.5),
+    marker:{symbol:'triangle-down',size:9,color:'#f85149',opacity:0.9,
+            line:{color:'#0d1117',width:0.5}},
+    name:'SELL',
+    customdata:sellSigs.map(s=>[s.str,s.h,s.sl,s.tp,s.lot]),
+    hovertemplate:'<b>SELL</b> %{x}<br>Str:%{customdata[0]:.2f} H:%{customdata[1]:.3f}<br>SL:%{customdata[2]:.1f} TP:%{customdata[3]:.1f} Lot:%{customdata[4]:.3f}<extra></extra>',
+  };
+
+  Plotly.react('main-chart',
+    [priceTrace,...trTraces,buyMk,sellMk],
+    {...BASE,
+     yaxis:{...BASE.yaxis,title:{text:'USD/oz',font:{size:10}}},
+     legend:{x:0,y:1,bgcolor:'rgba(0,0,0,0)',font:{size:10}},
+     showlegend:true},
+    CFG);
+
+  // ── Sub-charts ──────────────────────────────────────────────────────────────
+  Plotly.react('str-chart',[{
+    type:'bar',x:sx,y:sigs.map(s=>s._show?s.str:0),
+    marker:{color:sigs.map(s=>s._dir>0.25?'#3fb950':s._dir<-0.25?'#f85149':'#30363d')},
+    showlegend:false,hovertemplate:'%{x}<br>Str:%{y:.3f}<extra></extra>',
+  }],{...BASE,
+    yaxis:{...BASE.yaxis,range:[0,1],title:{text:'Strength',font:{size:9}}},
+    annotations:[annot('Signal Strength')]},CFG);
+
+  Plotly.react('hurst-chart',[
+    {type:'scattergl',mode:'lines',x:sx,y:sigs.map(s=>s.h),
+     line:{color:'#58a6ff',width:1},showlegend:false,
+     hovertemplate:'%{x}<br>H:%{y:.3f}<extra></extra>'},
+    {type:'scatter',mode:'lines',x:[sx[0],sx[sx.length-1]],y:[0.5,0.5],
+     line:{color:'#d29922',width:1,dash:'dot'},showlegend:false,hoverinfo:'skip'},
+  ],{...BASE,
+    yaxis:{...BASE.yaxis,range:[0.3,0.8],title:{text:'Hurst',font:{size:9}}},
+    annotations:[annot('Hurst DFA')]},CFG);
+
+  Plotly.react('tda-chart',[
+    {type:'scattergl',mode:'lines',x:sx,y:sigs.map(s=>s.tda),
+     fill:'tozeroy',fillcolor:'rgba(88,166,255,0.08)',
+     line:{color:'#58a6ff',width:1},showlegend:false,
+     hovertemplate:'%{x}<br>TDA:%{y:.4f}<extra></extra>'},
+    {type:'scatter',mode:'lines',x:[sx[0],sx[sx.length-1]],y:[0.35,0.35],
+     line:{color:'#f85149',width:1,dash:'dot'},showlegend:false,hoverinfo:'skip'},
+  ],{...BASE,
+    yaxis:{...BASE.yaxis,title:{text:'TDA',font:{size:9}}},
+    annotations:[annot('TDA Wasserstein (gate=0.35)')]},CFG);
+
+  // Sync x zoom
+  document.getElementById('main-chart').on('plotly_relayout',ev=>{
+    if(ev['xaxis.range[0]']!==undefined){
+      const u={'xaxis.range[0]':ev['xaxis.range[0]'],'xaxis.range[1]':ev['xaxis.range[1]']};
+      ['str-chart','hurst-chart','tda-chart'].forEach(id=>Plotly.relayout(id,u));
+    }
+    if(ev['xaxis.autorange']){
+      ['str-chart','hurst-chart','tda-chart'].forEach(id=>Plotly.relayout(id,{'xaxis.autorange':true}));
+    }
+  });
+
+  // Hover detail
+  document.getElementById('main-chart').on('plotly_hover',ev=>{
+    const pt=ev.points[0];
+    const t=pt.x;
+    const sig=sigs.find(s=>mt5ToISO(s.t)===t||s.t===t);
+    const bar=BARS.find(b=>mt5ToISO(b.t)===t||b.t===t);
+    let html='';
+    if(bar) html+=`<b>${bar.t}</b><br>O:${bar.o} H:${bar.h} L:${bar.l} C:${bar.c}<br>Vol:${bar.v}<br>`;
+    if(sig){
+      const dc=sig._dir>0.25?'#3fb950':sig._dir<-0.25?'#f85149':'#8b949e';
+      const ds=sig._dir>0.25?'BUY':sig._dir<-0.25?'SELL':'HOLD';
+      html+=`<span style="color:${dc}"><b>${ds}</b></span> Str:${sig.str.toFixed(2)}<br>`;
+      html+=`Hurst:${sig.h.toFixed(3)} TDA:${sig.tda.toFixed(4)}<br>`;
+      html+=`Regime:${sig.reg>0.5?'Bull':'Bear'} Actor:${sig.ad.toFixed(2)}<br>`;
+      if(sig._show) html+=`SL:${sig.sl.toFixed(1)} TP:${sig.tp.toFixed(1)} Lot:${sig.lot.toFixed(3)}`;
+    }
+    document.getElementById('bar-info').innerHTML=html||'<span style="color:var(--dim)">No data</span>';
+  });
+}
+
+function annot(txt){
+  return{x:0.01,y:0.97,xref:'paper',yref:'paper',text:txt,showarrow:false,
+         font:{color:'#8b949e',size:9}};
+}
+
+// ── Init ──────────────────────────────────────────────────────────────────────
+window.addEventListener('load', loadData);
+</script>
+</body>
+</html>
