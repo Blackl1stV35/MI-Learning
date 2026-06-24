@@ -11,7 +11,7 @@ use anyhow::Result;
 use log::{info, warn};
 use serde::{Deserialize, Serialize};
 use std::env;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::time::Duration;
 
@@ -82,11 +82,10 @@ fn load_actor(path: Option<String>) -> Option<DsacActor> {
     }
 }
 
-// ── Live TCP server ───────────────────────────────────────────────────────────
+// ── Live server — accepts both raw-JSON (MT5 TCP) and HTTP POST (MT5 WebRequest) ──
 fn run_server(args: &[String]) -> Result<()> {
     let bind_raw = arg_value(args, "--bind")
         .unwrap_or_else(|| "127.0.0.1:5555".into());
-    // Accept both "127.0.0.1:5555" and legacy "tcp://127.0.0.1:5555"
     let bind_addr = bind_raw
         .strip_prefix("tcp://")
         .unwrap_or(&bind_raw)
@@ -95,7 +94,7 @@ fn run_server(args: &[String]) -> Result<()> {
     let actor = load_actor(arg_value(args, "--actor"));
 
     let listener = TcpListener::bind(&bind_addr)?;
-    info!("Signal server listening on {} (TCP)", bind_addr);
+    info!("Signal server listening on {} (TCP + HTTP POST on same port)", bind_addr);
     info!("Actor: {}", if actor.is_some() { "loaded" } else { "rule-only" });
 
     let scatter  = ScatterBlock::new();
@@ -103,41 +102,111 @@ fn run_server(args: &[String]) -> Result<()> {
 
     'accept: loop {
         let (stream, addr) = listener.accept()?;
-        info!("MT5 connected from {}", addr);
         stream.set_read_timeout(Some(Duration::from_secs(30)))?;
 
         let mut writer = stream.try_clone()?;
         let mut reader = BufReader::new(stream);
-        let mut line   = String::new();
 
+        // Read first line to auto-detect protocol
+        let mut first_line = String::new();
+        match reader.read_line(&mut first_line) {
+            Ok(0)  => continue 'accept,
+            Ok(_)  => {}
+            Err(e) => { warn!("Read error from {}: {}", addr, e); continue 'accept; }
+        }
+
+        if first_line.starts_with("POST") || first_line.starts_with("GET") {
+            // HTTP protocol (from MT5 WebRequest) — single request / response / close
+            serve_http(&first_line, &mut reader, &mut writer, &scatter, &mut tda, &actor);
+            continue 'accept;
+        }
+
+        // Raw newline-delimited JSON (persistent connection, existing MT5 TCP protocol)
+        info!("MT5 connected from {} (raw JSON)", addr);
+        let mut line = first_line;
         loop {
-            line.clear();
-            match reader.read_line(&mut line) {
-                Ok(0)  => { info!("MT5 disconnected"); continue 'accept; }
-                Ok(_)  => {}
-                Err(e) => { warn!("Read error: {}", e); continue 'accept; }
-            }
-
-            match handle_request(line.trim().as_bytes(), &scatter, &mut tda, &actor) {
-                Ok(resp) => {
-                    let mut out = serde_json::to_vec(&resp)?;
-                    out.push(b'\n');
-                    if let Err(e) = writer.write_all(&out) {
-                        warn!("Write error: {}", e);
-                        continue 'accept;
+            if !line.trim().is_empty() {
+                match handle_request(line.trim().as_bytes(), &scatter, &mut tda, &actor) {
+                    Ok(resp) => {
+                        let mut out = serde_json::to_vec(&resp)?;
+                        out.push(b'\n');
+                        if let Err(e) = writer.write_all(&out) {
+                            warn!("Write error: {}", e);
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Request error: {}", e);
+                        let mut err = serde_json::to_vec(
+                            &serde_json::json!({"error": e.to_string()})
+                        )?;
+                        err.push(b'\n');
+                        let _ = writer.write_all(&err);
                     }
                 }
-                Err(e) => {
-                    warn!("Request error: {}", e);
-                    let mut err = serde_json::to_vec(
-                        &serde_json::json!({"error": e.to_string()})
-                    )?;
-                    err.push(b'\n');
-                    let _ = writer.write_all(&err);
-                }
+            }
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0)  => break,
+                Ok(_)  => {}
+                Err(e) => { warn!("Read error: {}", e); break; }
             }
         }
+        info!("MT5 disconnected");
     }
+}
+
+// ── HTTP handler (for MT5 WebRequest fallback when raw socket is broker-blocked) ──
+fn serve_http<R: Read>(
+    _request_line: &str,
+    reader:        &mut BufReader<R>,
+    writer:        &mut impl Write,
+    scatter:       &ScatterBlock,
+    tda:           &mut WassersteinTracker,
+    actor:         &Option<DsacActor>,
+) {
+    // Parse headers — we only need Content-Length
+    let mut content_length = 0usize;
+    loop {
+        let mut hdr = String::new();
+        match reader.read_line(&mut hdr) {
+            Ok(0) | Err(_) => return,
+            _ => {}
+        }
+        let t = hdr.trim();
+        if t.is_empty() { break; } // blank line = end of headers
+        if t.len() > 15 && t[..15].eq_ignore_ascii_case("content-length:") {
+            content_length = t[15..].trim().parse().unwrap_or(0);
+        }
+    }
+
+    if content_length == 0 {
+        let _ = writer.write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n");
+        return;
+    }
+
+    let mut body = vec![0u8; content_length];
+    if reader.read_exact(&mut body).is_err() { return; }
+
+    let resp_bytes = match handle_request(&body, scatter, tda, actor) {
+        Ok(resp)  => {
+            info!("HTTP signal: final_dir={:.2} actor={:.4} strength={:.2} regime={:.2}",
+                  resp.final_dir, resp.actor_dir, resp.signal_strength, resp.regime);
+            serde_json::to_vec(&resp).unwrap_or_default()
+        }
+        Err(e)    => {
+            warn!("HTTP request error: {}", e);
+            serde_json::to_vec(&serde_json::json!({"error": e.to_string()}))
+                .unwrap_or_default()
+        }
+    };
+
+    let header = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        resp_bytes.len()
+    );
+    let _ = writer.write_all(header.as_bytes());
+    let _ = writer.write_all(&resp_bytes);
 }
 
 // ── Offline replay ────────────────────────────────────────────────────────────
@@ -147,6 +216,11 @@ fn run_server(args: &[String]) -> Result<()> {
 //                      should_exit,hurst,tda_wasserstein,regime,actor_dir,
 //                      actor_confidence,sl_pips,tp_pips,lot_suggestion
 //
+// --obs-out <path>   : writes a binary file of 118D obs vectors, one per signal
+//                      row (same order). Format: [n_rows:u32LE][n_cols:u32LE]
+//                      then n_rows × n_cols × f32LE. Load in Python with
+//                      np.frombuffer(f.read(n*118*4), dtype='<f4').reshape(n,118)
+//
 // pos_dir / unrealized / hold_fraction are held at 0 (flat-position assumption).
 // TDA tracker is stateful and processes bars in sequence — do not shuffle input.
 fn run_replay(args: &[String]) -> Result<()> {
@@ -154,6 +228,7 @@ fn run_replay(args: &[String]) -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("--bars <path> required for replay"))?;
     let out_path  = arg_value(args, "--out")
         .ok_or_else(|| anyhow::anyhow!("--out <path> required for replay"))?;
+    let obs_path  = arg_value(args, "--obs-out");
 
     let actor   = load_actor(arg_value(args, "--actor"));
     let scatter = ScatterBlock::new();
@@ -165,6 +240,11 @@ fn run_replay(args: &[String]) -> Result<()> {
 
     let mut window: Vec<[f32; 8]> = Vec::with_capacity(SEQ_LEN);
     let mut out   = std::fs::File::create(&out_path)?;
+    let mut all_obs: Vec<Vec<f32>> = if obs_path.is_some() {
+        Vec::with_capacity(100_000)
+    } else {
+        Vec::new()
+    };
 
     writeln!(out,
         "datetime,direction_bias,signal_strength,final_dir,should_exit,\
@@ -215,13 +295,31 @@ fn run_replay(args: &[String]) -> Result<()> {
                     r.actor_dir, r.actor_confidence,
                     r.sl_pips, r.tp_pips, r.lot_suggestion,
                 )?;
+                if obs_path.is_some() {
+                    all_obs.push(r.obs);
+                }
                 sig_n += 1;
             }
             Err(e) => warn!("Replay bar {}: {}", datetime, e),
         }
     }
 
-    info!("Replay done — {} bars in, {} rows out → {}", bar_n, sig_n, out_path);
+    info!("Replay done -- {} bars in, {} rows out -> {}", bar_n, sig_n, out_path);
+
+    // Write obs binary: [n_rows:u32][n_cols:u32][n_rows * n_cols * f32]
+    if let Some(ref path) = obs_path {
+        let n = all_obs.len() as u32;
+        let mut f = std::fs::File::create(path)?;
+        f.write_all(&n.to_le_bytes())?;
+        f.write_all(&(OBS_DIM as u32).to_le_bytes())?;
+        for obs in &all_obs {
+            for &v in obs {
+                f.write_all(&v.to_le_bytes())?;
+            }
+        }
+        info!("Obs binary written: {} rows x {} cols -> {}", n, OBS_DIM, path);
+    }
+
     Ok(())
 }
 

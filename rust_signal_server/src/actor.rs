@@ -11,10 +11,18 @@ pub struct DsacActor {
     w0: Array2<f32>, b0: Array1<f32>,
     w2: Array2<f32>, b2: Array1<f32>,
     w4: Array2<f32>, b4: Array1<f32>,
+    // Optional z-score normalization for obs vectors.
+    // Present when trained on real XAUUSD scatter (scatter features are in
+    // price scale ~2500-5000 USD/oz; normalization keeps them in NN-friendly range).
+    // Absent for models trained on synthetic data (already normalized).
+    obs_mean: Option<Vec<f32>>,
+    obs_std:  Option<Vec<f32>>,
 }
 
 impl DsacActor {
-    /// Load from JSON weights file exported by export_actor.py.
+    /// Load from JSON weights file exported by train_offline.py / export_actor.py.
+    /// Optional keys obs_mean/obs_std enable z-score normalization of obs before
+    /// the forward pass (required when scatter features are in raw price scale).
     pub fn load<P: AsRef<Path>>(json_path: P) -> Result<Self> {
         let content = std::fs::read_to_string(&json_path)
             .with_context(|| format!("cannot read {:?}", json_path.as_ref()))?;
@@ -38,17 +46,40 @@ impl DsacActor {
             anyhow::ensure!(flat.len() == len, "bias length mismatch for {key}");
             Ok(Array1::from_vec(flat))
         };
+        let load_norm = |key: &str| -> Option<Vec<f32>> {
+            v[key].as_array().map(|arr| {
+                arr.iter().map(|x| x.as_f64().unwrap_or(0.0) as f32).collect()
+            })
+        };
+
+        let obs_mean = load_norm("obs_mean");
+        let obs_std  = load_norm("obs_std");
+        if obs_mean.is_some() {
+            log::info!("Actor: obs normalization enabled (real scatter scale)");
+        }
 
         Ok(Self {
             w0: load_mat("w0", 512, 118)?,  b0: load_vec("b0", 512)?,
             w2: load_mat("w2", 256, 512)?,  b2: load_vec("b2", 256)?,
             w4: load_mat("w4",   2, 256)?,  b4: load_vec("b4",   2)?,
+            obs_mean,
+            obs_std,
         })
     }
 
     pub fn forward(&self, obs: &[f32]) -> Result<(f32, f32)> {
         anyhow::ensure!(obs.len() == 118, "obs must be 118-dim, got {}", obs.len());
-        let x = Array1::from_vec(obs.to_vec());
+
+        // Apply z-score normalization if stats are present
+        let x: Array1<f32> = match (&self.obs_mean, &self.obs_std) {
+            (Some(mean), Some(std)) => {
+                let normed: Vec<f32> = obs.iter().zip(mean.iter()).zip(std.iter())
+                    .map(|((x, m), s)| (x - m) / s)
+                    .collect();
+                Array1::from_vec(normed)
+            }
+            _ => Array1::from_vec(obs.to_vec()),
+        };
 
         let x = relu(self.w0.dot(&x) + &self.b0);
         let x = relu(self.w2.dot(&x) + &self.b2);

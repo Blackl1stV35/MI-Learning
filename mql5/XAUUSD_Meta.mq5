@@ -13,7 +13,7 @@
 //--- Connection parameters
 input string SERVER_HOST  = "127.0.0.1";
 input int    SERVER_PORT  = 5555;
-input string LOG_PATH     = "C:\\Program Files\\MetaTrader 5\\override_log.csv";
+input string LOG_PATH     = "override_log.csv";   // written to MT5 Common\Files
 input string CONTEXT_PATH = "C:\\Program Files\\MetaTrader 5\\session_context.json";
 input int    BARS_HISTORY = 240;
 input bool   SHOW_PANEL   = true;
@@ -24,6 +24,7 @@ input string SIGNALS_CSV  = "";
 //--- Native socket handle
 int  g_socket    = INVALID_HANDLE;
 bool g_connected = false;
+bool g_use_http  = false;   // set when broker blocks SocketConnect (err 4014)
 
 //--- Signal cache (populated from server or from pre-computed CSV)
 double   g_direction   = 0;
@@ -76,19 +77,28 @@ int OnInit()
         return INIT_SUCCEEDED;
     }
 
-    //--- Live mode: open TCP socket to Rust server
+    //--- Live mode: try TCP socket; fall back to HTTP if broker blocks it
     g_socket = SocketCreate();
     if(g_socket == INVALID_HANDLE) {
-        Print("SocketCreate failed — check MT5 build (requires 2485+)");
-        return INIT_SUCCEEDED; // continue in rule-only / display-only mode
-    }
-
-    if(SocketConnect(g_socket, SERVER_HOST, (uint)SERVER_PORT, 3000)) {
+        Print("SocketCreate failed (err=", GetLastError(), ") → HTTP mode");
+        g_use_http = true;
+    } else if(SocketConnect(g_socket, SERVER_HOST, (uint)SERVER_PORT, 3000)) {
         g_connected = true;
-        Print("Signal server connected: ", SERVER_HOST, ":", SERVER_PORT);
+        Print("Signal server connected (TCP): ", SERVER_HOST, ":", SERVER_PORT);
     } else {
-        Print("WARNING: Cannot connect to signal server — rule-only mode");
+        int err = GetLastError();
+        SocketClose(g_socket);
+        g_socket = INVALID_HANDLE;
+        if(err == 4014) {
+            Print("SocketConnect blocked (err 4014) → HTTP mode");
+            g_use_http = true;
+        } else {
+            Print("WARNING: Cannot connect to signal server (err=", err, ") — display-only mode");
+        }
     }
+    if(g_use_http)
+        Print("HTTP mode: ensure http://", SERVER_HOST, ":", SERVER_PORT,
+              " is whitelisted in Tools→Options→Expert Advisors");
     return INIT_SUCCEEDED;
 }
 
@@ -150,12 +160,17 @@ int OnCalculate(const int rates_total,
     double pos_dir = 0, unrealized = 0, hold_frac = 0;
     GetPositionState(pos_dir, unrealized, hold_frac);
 
-    string request = StringFormat(
-        "{\"bars\":%s,\"pos_dir\":%.1f,\"unrealized\":%.5f,\"hold_fraction\":%.4f}\n",
-        bars_json, pos_dir, unrealized, hold_frac);
+    // Build request via concatenation — StringFormat caps at 4096 chars but
+    // bars_json alone is ~17 KB, so we MUST NOT pass it through StringFormat.
+    string tail = StringFormat(
+        ",\"pos_dir\":%.1f,\"unrealized\":%.5f,\"hold_fraction\":%.4f}\n",
+        pos_dir, unrealized, hold_frac);
+    string request = "{\"bars\":" + bars_json + tail;
 
     //--- Send to Rust server and parse response
-    if(g_connected && g_socket != INVALID_HANDLE) {
+    if(g_use_http) {
+        GetSignalHTTP(request);
+    } else if(g_connected && g_socket != INVALID_HANDLE) {
         if(!SocketIsConnected(g_socket)) {
             g_connected = false;
             Print("Server disconnected — attempting reconnect");
@@ -177,6 +192,36 @@ int OnCalculate(const int rates_total,
 
     if(SHOW_PANEL) DrawPanel();
     return rates_total;
+}
+
+//+------------------------------------------------------------------+
+// HTTP fallback — used when broker blocks raw socket (err 4014).
+// URL http://127.0.0.1:5555 must be whitelisted in MT5 Options.
+bool GetSignalHTTP(const string &req_str)
+{
+    uchar req_data[];
+    StringToCharArray(req_str, req_data, 0, StringLen(req_str));
+
+    uchar  resp_data[];
+    string resp_headers;
+    int code = WebRequest(
+        "POST",
+        StringFormat("http://%s:%d/", SERVER_HOST, SERVER_PORT),
+        "Content-Type: application/json\r\n",
+        5000,
+        req_data,
+        resp_data,
+        resp_headers
+    );
+
+    if(code != 200) {
+        Print("XAUUSD_Meta HTTP error code=", code, " err=", GetLastError(),
+              " — whitelist http://127.0.0.1:5555 in Tools→Options→Expert Advisors");
+        return false;
+    }
+
+    ParseResponse(CharArrayToString(resp_data));
+    return true;
 }
 
 //+------------------------------------------------------------------+
@@ -401,10 +446,10 @@ void CheckOverride()
 
 void LogOverride(int user_dir, double user_lot, string event_type)
 {
-    int fh = FileOpen(LOG_PATH, FILE_READ | FILE_WRITE | FILE_CSV | FILE_ANSI, ',');
+    int fh = FileOpen(LOG_PATH, FILE_READ|FILE_WRITE|FILE_CSV|FILE_ANSI|FILE_COMMON, ',');
     if(fh == INVALID_HANDLE) {
-        fh = FileOpen(LOG_PATH, FILE_WRITE | FILE_CSV | FILE_ANSI, ',');
-        if(fh == INVALID_HANDLE) { Print("Cannot open log: ", LOG_PATH); return; }
+        fh = FileOpen(LOG_PATH, FILE_WRITE|FILE_CSV|FILE_ANSI|FILE_COMMON, ',');
+        if(fh == INVALID_HANDLE) { Print("Cannot open log: ", LOG_PATH, " err:", GetLastError()); return; }
         FileWrite(fh,
             "timestamp,symbol,rule_dir,final_dir,actor_dir,signal_strength,"
             "user_dir,user_lot,hurst,tda_w,event_risk,regime,event_type");
