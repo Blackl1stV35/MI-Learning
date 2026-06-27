@@ -541,17 +541,11 @@ fn meta_policy_signal(
     ];
     let n_sell: f32 = sell_votes.iter().map(|&v| v as u8 as f32).sum();
     let n_buy:  f32 = buy_votes.iter().map(|&v| v as u8 as f32).sum();
+    let thresh  = if ind.hurst > 0.50 { 3.0 } else { 4.0 };
 
-    // Direction-aware thresholds: with-trend trades are easier to trigger,
-    // counter-trend trades require near-consensus.  Bull/bear asymmetry
-    // directly targets the observed -38K bull-regime P&L vs +130K bear-regime.
-    let base       = if ind.hurst > 0.50 { 3.0f32 } else { 4.0f32 };
-    let buy_thresh  = if bull  { base } else { base + 1.0 };
-    let sell_thresh = if !bull { base } else { base + 1.0 };
-
-    if n_sell >= sell_thresh && n_sell > n_buy {
+    if n_sell >= thresh && n_sell > n_buy {
         (-1.0, n_sell / 5.0)
-    } else if n_buy >= buy_thresh && n_buy > n_sell {
+    } else if n_buy >= thresh && n_buy > n_sell {
         (1.0, n_buy / 5.0)
     } else {
         (0.0, 0.0)
